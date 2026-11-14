@@ -61,8 +61,13 @@ comments and strings, for:
 - `(channel ...)` forms: reads each with `read` to get name, URL and branch,
   and rewrites only the `(commit "...")` inside. With the `channels` setting
   the scan is limited to that variable's `(define ...)` form.
-- the package list, `(define NAME '("..." ...))`: adds, removes or replaces
-  one string, leaving formatting and comments alone.
+- the package list: either names, `(define NAME '("..." ...))`, or values,
+  `(define (NAME) (list VARIABLE ... ))`. It finds the elements by
+  position and adds, removes or replaces one, leaving formatting and
+  comments alone. A variable is matched to a package name through a table
+  of every public package variable of the running Guix (built on demand);
+  an added element is written `(specification->package "NAME")`, which
+  needs no module import.
 
 Edits are written to a temporary file and renamed over the config, which is
 resolved through symlinks first (its directory is where git runs).

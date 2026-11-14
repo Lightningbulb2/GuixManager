@@ -52,7 +52,8 @@ GUIX_EXTENSIONS_PATH=$PWD/extensions guix bump --help
 
 - **Channels** written as `(channel ... (commit "..."))` forms. `guix bump`
   rewrites the commits; a channel with no `commit` gets one.
-- **A list of package names** for `--install` and `--remove` to edit:
+- **A list of packages** for `--install` and `--remove` to edit, which your
+  home environment installs. Either a list of names:
 
   ```scheme
   (define %managed-packages
@@ -60,7 +61,16 @@ GUIX_EXTENSIONS_PATH=$PWD/extensions guix bump --help
   ```
 
   with `(map specification->package %managed-packages)` among the home
-  environment's packages. Packages your config names in any other way are
+  packages, or the list of package values you already have:
+
+  ```scheme
+  (define (%home-packages)
+    (list firefox git ...))
+  ```
+
+  (`guix bump --set packages=%home-packages`). In such a list, variables
+  and `(specification->package "NAME")` calls are understood; what is added
+  is written as `(specification->package "NAME")`. Any other expression is
   shown but never edited.
 - If the config is in a git repository, each change is committed and pushed.
 

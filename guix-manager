@@ -22,7 +22,7 @@ gi.require_version("Vte", "3.91")
 from gi.repository import Adw, Gio, GLib, Gtk, Pango, Vte  # noqa: E402
 
 APP_ID = "io.github.lightningbulb2.GuixManager"
-VERSION = "2.1"
+VERSION = "2.2"
 
 
 def guix():
@@ -237,13 +237,14 @@ class Window(Adw.ApplicationWindow):
         self.filter_entry.connect("search-changed",
                                   lambda *_: self.fill_installed())
         mine = Adw.PreferencesGroup(
-            title="Installed from here",
-            description="Added with Guix Manager or `guix bump --install'.  "
-                        "Remove one, or choose which version to keep.")
+            title="Your apps",
+            description="The package list of your config file.  Remove one, "
+                        "or choose which version to keep.")
         other = Adw.PreferencesGroup(
-            title="Set in the config file",
-            description="Written into config.scm by hand.  Edit the file to "
-                        "remove or change these.")
+            title="Installed another way",
+            description="Brought in by something else in the config file (a "
+                        "service, or an expression Guix Manager does not "
+                        "read).  Edit the file to change these.")
         self.mine_rows = RowList(mine)
         self.other_rows = RowList(other)
         self.mine_group, self.other_group = mine, other

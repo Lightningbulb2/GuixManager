@@ -17,6 +17,7 @@
   #:use-module (guix scripts)
   #:use-module (guix describe)
   #:use-module (guix channels)
+  #:use-module (guix discovery)
   #:use-module (guix packages)
   #:use-module ((guix utils) #:select (version>?))
   #:use-module (guix profiles)
@@ -32,7 +33,7 @@
   #:use-module (srfi srfi-1)
   #:export (guix-bump))
 
-(define %version "2.1")
+(define %version "2.2")
 
 ;; Replaced with a store file name when the package is built.
 (define %git "@GIT@")
@@ -201,13 +202,17 @@ See `guix bump --help'.~%")
 (define (definition-form text variables)
   ;; Return (START . END) of the first (define VARIABLE ...) form in TEXT
   ;; for one of VARIABLES, or #f.  Comments and strings are skipped.
+  ;; Both (define VARIABLE ...) and (define (VARIABLE) ...).
   (define (definition? i)
     (any (lambda (variable)
-           (let* ((prefix (string-append "(define " variable))
-                  (end    (+ i (string-length prefix))))
-             (and (< end (string-length text))
-                  (string=? (substring text i end) prefix)
-                  (char-whitespace? (string-ref text end)))))
+           (any (lambda (prefix)
+                  (let ((end (+ i (string-length prefix))))
+                    (and (< end (string-length text))
+                         (string=? (substring text i end) prefix)
+                         (let ((c (string-ref text end)))
+                           (or (char-whitespace? c) (char=? c #\)))))))
+                (list (string-append "(define " variable)
+                      (string-append "(define (" variable))))
          variables))
   (let loop ((i 0))
     (and (< i (string-length text))
@@ -776,40 +781,147 @@ pulled is shown.~%")
 ;;;
 ;;; Installing and removing packages: the list of names in the config.
 ;;;
-;;; The config holds one list of package names that is ours to edit:
+;;; The config holds one list of packages that is ours to edit, which the
+;;; home environment installs.  It is either a list of names,
 ;;;
 ;;;   (define %managed-packages
 ;;;     '("hello"
 ;;;       "node@22.14.0"))
 ;;;
-;;; and adds (map specification->package %managed-packages) to the home
-;;; packages.  Installing writes a name into that list and applies the home;
-;;; removing takes it out.  Packages the config names in any other way are
-;;; left to whoever wrote them.
+;;; used as (map specification->package %managed-packages), or a list of
+;;; package values,
+;;;
+;;;   (define (%home-packages)
+;;;     (list firefox node ...))
+;;;
+;;; Installing adds an element and applies the home; removing takes one
+;;; out.  Elements that are neither a package variable nor a
+;;; (specification->package "NAME") call are left to whoever wrote them.
 
 ;; The variable holding the list: the `packages' setting, else the first of
-;; these that the config defines.
+;; these that the config defines.  The setting may be written with the
+;; parentheses of a procedure, "(%home-packages)".
 (define (managed-variables)
   (match (setting "packages")
     (#f '("%managed-packages" "%apps"))
-    (variable (list variable))))
+    (variable
+     (list (string-trim-both variable
+                             (lambda (c) (memv c '(#\( #\) #\space))))))))
 
 (define (managed-form text)
   ;; Return (START . END) of the form defining the managed list in TEXT, or
   ;; #f.
   (definition-form text (managed-variables)))
 
-(define (managed-specs text)
-  ;; Return the list of package specifications ("NAME" or "NAME@VERSION")
-  ;; in the managed list of TEXT, or #f when there is no such list.
+;; The list can be written in two ways:
+;;
+;;   names    (define %apps '("firefox" "node@22.14.0"))
+;;   values   (define (%home-packages) (list firefox node (f x)))
+;;
+;; In a list of values an element is a variable bound to a package, a
+;; (specification->package "NAME") call, or anything else; only the first
+;; two are understood, and the rest is left alone.
+
+(define (managed-list text)
+  ;; Return (KIND START END): the list inside the managed form, where START
+  ;; is at its opening parenthesis, END is after its closing one and KIND is
+  ;; `names' or `values'.  #f when there is none.
   (match (managed-form text)
+    (#f #f)
     ((start . end)
-     (match (false-if-exception
-             (call-with-input-string (substring text start end) read))
-       (('define _ ('quote (specs ...)))
-        (and (every string? specs) specs))
-       (_ #f)))
-    (_ #f)))
+     (let loop ((i (+ start 1)))
+       (and (< i end)
+            (let ((c (string-ref text i)))
+              (cond ((char=? c #\;) (loop (skip-line text i)))
+                    ((char=? c #\") (loop (skip-string text i)))
+                    ((and (char=? c #\') (< (+ i 1) end)
+                          (char=? (string-ref text (+ i 1)) #\())
+                     (list 'names (+ i 1) (form-end text (+ i 1))))
+                    ((and (char=? c #\() (< (+ i 6) end)
+                          (string=? (substring text i (+ i 5)) "(list")
+                          (char-whitespace? (string-ref text (+ i 5))))
+                     (list 'values i (form-end text i)))
+                    (else (loop (+ i 1))))))))))
+
+(define (list-elements text kind start end)
+  ;; Return ((S . E) ...), the elements of the list from START to END.
+  (define (delimiter? c)
+    (or (char-whitespace? c) (memv c '(#\( #\) #\" #\;))))
+  (define last (- end 1))               ;the closing parenthesis
+  (let loop ((i (+ start (if (eq? kind 'values) 5 1)))
+             (result '()))
+    (if (>= i last)
+        (reverse result)
+        (let ((c (string-ref text i)))
+          (cond ((char-whitespace? c) (loop (+ i 1) result))
+                ((char=? c #\;) (loop (skip-line text i) result))
+                ((char=? c #\")
+                 (let ((e (skip-string text i)))
+                   (loop e (cons (cons i e) result))))
+                ((char=? c #\()
+                 (let ((e (form-end text i)))
+                   (loop e (cons (cons i e) result))))
+                (else
+                 ;; An atom, or a prefix such as ' or #~ before a form.
+                 (let* ((stop (or (string-index text delimiter? i last) last))
+                        (e    (if (and (< stop last)
+                                       (char=? (string-ref text stop) #\()
+                                       (> stop i))
+                                  (form-end text stop)
+                                  stop)))
+                   (loop (max e (+ i 1)) (cons (cons i e) result)))))))))
+
+;; Variable name -> names of the packages public variables of that name are
+;; bound to, in the running Guix.  Built when first needed: it loads every
+;; package module.
+(define %variable-packages
+  (delay
+    (let ((table (make-hash-table)))
+      (fold-module-public-variables*
+       (lambda (module symbol variable result)
+         (let ((value (false-if-exception (variable-ref variable))))
+           (when (package? value)
+             (hash-set! table symbol
+                        (lset-adjoin string=? (hash-ref table symbol '())
+                                     (package-name value)))))
+         result)
+       #f
+       (all-modules (%package-module-path) #:warn (const #f)))
+      table)))
+
+(define (element-specs text element)
+  ;; Return the package specifications the ELEMENT (S . E) of the managed
+  ;; list may stand for: one for a name, one or more for a variable (the
+  ;; same variable name can exist in several modules), '() for anything
+  ;; that is not understood.
+  (match (false-if-exception
+          (call-with-input-string (substring text (car element) (cdr element))
+            read))
+    ((? string? spec) (list spec))
+    (('specification->package (? string? spec)) (list spec))
+    ((? symbol? variable)
+     (hash-ref (force %variable-packages) variable '()))
+    (_ '())))
+
+(define (managed-elements text)
+  ;; Return (KIND ((S . E) SPEC ...) ...) for the managed list of TEXT, or
+  ;; #f when there is no such list.
+  (match (managed-list text)
+    (#f #f)
+    ((kind start end)
+     (cons kind
+           (map (lambda (element)
+                  (cons element (element-specs text element)))
+                (list-elements text kind start end))))))
+
+(define (managed-specs text)
+  ;; Return the package specifications ("NAME" or "NAME@VERSION") the
+  ;; managed list of TEXT installs, as far as they are understood, or #f
+  ;; when there is no such list.
+  (match (managed-elements text)
+    (#f #f)
+    ((_ . elements)
+     (append-map (match-lambda ((_ . specs) specs)) elements))))
 
 (define (spec-name spec)
   (car (string-split spec #\@)))
@@ -819,76 +931,95 @@ pulled is shown.~%")
     ((_ version) version)
     (_ #f)))
 
-(define (spec-rx name)
-  ;; Matches the specification of NAME, with the blanks before it on its
-  ;; line.
-  (make-regexp (string-append "[ \t]*\"" (regexp-quote name)
-                              "(@[^\"]*)?\"")))
+(define (find-element text name)
+  ;; Return the element (S . E) of the managed list that installs the
+  ;; package NAME, or #f.
+  (match (managed-elements text)
+    (#f #f)
+    ((_ . elements)
+     (any (match-lambda
+            ((element . specs)
+             (and (any (lambda (spec) (string=? (spec-name spec) name)) specs)
+                  element)))
+          elements))))
+
+(define (spec-text kind spec)
+  ;; How SPEC is written in a list of KIND.
+  (if (eq? kind 'names)
+      (format #f "~s" spec)
+      (format #f "(specification->package ~s)" spec)))
+
+(define (blank? string)
+  (string-every (lambda (c) (memv c '(#\space #\tab))) string))
 
 (define (add-spec text spec)
   ;; Return TEXT with SPEC as the last element of the managed list.
-  (match (managed-form text)
-    ((start . end)
-     (let* ((form   (substring text start end))
-            ;; The list's closing parenthesis: the last one but one.
-            (close  (string-rindex form #\) 0 (- (string-length form) 1)))
-            (quoted (string-index form #\"))
-            (indent (if quoted
-                        (column form quoted)
-                        4)))
-       (string-append (substring text 0 start)
-                      (string-trim-right (substring form 0 close))
-                      (if quoted             ;else the list is empty
-                          (string-append "\n" (make-string indent #\space))
-                          "")
-                      (format #f "~s" spec)
-                      (substring form close)
-                      (substring text end))))))
+  (match (managed-list text)
+    ((kind start end)
+     (let* ((elements (list-elements text kind start end))
+            (close    (- end 1))
+            (indent   (match elements
+                        (((s . _) . _) (column text s))
+                        (() #f))))
+       (string-append (string-trim-right (substring text 0 close))
+                      (cond (indent
+                             (string-append "\n" (make-string indent #\space)))
+                            ((eq? kind 'values) " ")
+                            (else ""))
+                      (spec-text kind spec)
+                      (substring text close))))))
 
 (define (remove-spec text name)
-  ;; Return TEXT without the specification of NAME in the managed list.
-  ;; Line breaks are kept, so a comment before it stays a comment and
-  ;; nothing after it is drawn into one; a line left empty is dropped.
-  (define (blank? string)
-    (string-every (lambda (c) (memv c '(#\space #\tab))) string))
-  (match (managed-form text)
-    ((start . end)
-     (let ((form (substring text start end)))
-       (match (regexp-exec (spec-rx name) form)
-         (#f text)
-         (m
-          (let* ((before  (match:prefix m))
-                 (after   (match:suffix m))
-                 (newline (string-index after #\newline))
-                 ;; Was it alone on its line?
-                 (alone?  (and (string-suffix? "\n" before)
-                               newline
-                               (blank? (substring after 0 newline)))))
-            (string-append
-             (substring text 0 start)
-             before
-             (cond (alone? (substring after (+ newline 1)))
-                   ;; It was the first: no blank after "(".
-                   ((string-suffix? "(" before)
-                    (string-trim after (lambda (c)
-                                         (memv c '(#\space #\tab)))))
-                   (else after))
-             (substring text end)))))))))
+  ;; Return TEXT without the element of the managed list that installs
+  ;; NAME.  Line breaks are kept, so a comment before it stays a comment
+  ;; and nothing after it is drawn into one.  An element alone on its line
+  ;; goes with the whole line, its trailing comment included.
+  (match (find-element text name)
+    (#f text)
+    ((s . e)
+     (let* ((line-start (match (string-rindex text #\newline 0 s)
+                          (#f 0)
+                          (i (+ i 1))))
+            (line-end   (or (string-index text #\newline e)
+                            (string-length text)))
+            (before     (substring text line-start s))
+            (after      (substring text e line-end))
+            (rest       (string-trim after (lambda (c)
+                                             (memv c '(#\space #\tab)))))
+            (opening?   (let ((head (string-trim-right before)))
+                          (or (string-suffix? "(" head)
+                              (string-suffix? "(list" head)))))
+       (cond
+        ;; Alone on its line, perhaps with a comment about it.
+        ((and (blank? before)
+              (or (string-null? rest) (string-prefix? ";" rest))
+              (< line-end (string-length text)))
+         (string-append (substring text 0 line-start)
+                        (substring text (+ line-end 1))))
+        ;; The first element, right after the opening: bring the next one
+        ;; up, unless a comment follows on this line.
+        (opening?
+         (if (string-prefix? ";" rest)
+             (string-append (substring text 0 s) (substring text e))
+             (string-append
+              (substring text 0 s)
+              (string-trim (substring text e) char-whitespace?))))
+        (else
+         (string-append (string-trim-right (substring text 0 s)
+                                           (lambda (c)
+                                             (memv c '(#\space #\tab))))
+                        (substring text e))))))))
 
 (define (replace-spec text spec)
-  ;; Return TEXT with the specification of SPEC's package replaced by SPEC.
-  (match (managed-form text)
-    ((start . end)
-     (let ((form (substring text start end)))
-       (match (regexp-exec (make-regexp
-                            (string-append "\"" (regexp-quote (spec-name spec))
-                                           "(@[^\"]*)?\""))
-                           form)
-         (#f text)
-         (m (string-append (substring text 0 start)
-                           (match:prefix m) (format #f "~s" spec)
-                           (match:suffix m)
-                           (substring text end))))))))
+  ;; Return TEXT with the element that installs SPEC's package written as
+  ;; SPEC.
+  (match (find-element text (spec-name spec))
+    (#f text)
+    ((s . e)
+     (match (managed-list text)
+       ((kind . _)
+        (string-append (substring text 0 s) (spec-text kind spec)
+                       (substring text e)))))))
 
 (define (versions-of name)
   ;; The versions of the package NAME in the running Guix, newest first.

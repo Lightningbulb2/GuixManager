@@ -93,6 +93,63 @@
         ((f 'remove-spec) "(define %apps\n  '(\"a\" ;note\n    \"b\"))\n" "b"))
        '("a"))
 
+(define values-config "\
+(define (%home-packages)
+  (list hello
+        guix ;the package manager
+        ;; a comment on its own line
+        (specification->package \"node@22.14.0\")
+        (list glib \"bin\")
+        coreutils))
+")
+((f 'write-setting!) "packages" "(%home-packages)")
+(check "a list of values: what is understood"
+       ((f 'managed-specs) values-config)
+       '("hello" "guix" "node@22.14.0" "coreutils"))
+(check "values: remove the first"
+       ((f 'remove-spec) values-config "hello")
+       "\
+(define (%home-packages)
+  (list guix ;the package manager
+        ;; a comment on its own line
+        (specification->package \"node@22.14.0\")
+        (list glib \"bin\")
+        coreutils))
+")
+(check "values: remove one with its comment"
+       ((f 'managed-specs) ((f 'remove-spec) values-config "guix"))
+       '("hello" "node@22.14.0" "coreutils"))
+(check "values: remove a specification"
+       ((f 'managed-specs) ((f 'remove-spec) values-config "node"))
+       '("hello" "guix" "coreutils"))
+(check "values: remove the last"
+       ((f 'managed-specs) ((f 'remove-spec) values-config "coreutils"))
+       '("hello" "guix" "node@22.14.0"))
+(check "values: what is not understood stays"
+       (->bool (string-contains ((f 'remove-spec) values-config "coreutils")
+                                "(list glib \"bin\")"))
+       #t)
+(check "values: add"
+       ((f 'managed-specs) ((f 'add-spec) values-config "sed"))
+       '("hello" "guix" "node@22.14.0" "coreutils" "sed"))
+(check "values: an added one is written as a specification"
+       (->bool (string-contains ((f 'add-spec) values-config "sed")
+                                "\n        (specification->package \"sed\"))"))
+       #t)
+(check "values: keep a version of a variable"
+       ((f 'managed-specs) ((f 'replace-spec) values-config "hello@2.10"))
+       '("hello@2.10" "guix" "node@22.14.0" "coreutils"))
+(check "values: every edit still reads as Scheme"
+       (every (lambda (text)
+                (->bool (false-if-exception
+                         (call-with-input-string text read))))
+              (list ((f 'remove-spec) values-config "hello")
+                    ((f 'remove-spec) values-config "guix")
+                    ((f 'remove-spec) values-config "coreutils")
+                    ((f 'add-spec) values-config "sed")))
+       #t)
+((f 'write-setting!) "packages" "")
+
 (define empty "(define %managed-packages\n  '())\n")
 (check "add to an empty list"
        ((f 'add-spec) empty "hello")
