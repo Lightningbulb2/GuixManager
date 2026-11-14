@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Guix Manager
+Comment=Update, install and remove apps; every change goes into the config
+Exec=guix-manager
+Icon=system-software-update
+Terminal=false
+Categories=System;Settings;GTK;
+Keywords=update;upgrade;install;remove;uninstall;software;packages;guix;bump;
+StartupNotify=true
