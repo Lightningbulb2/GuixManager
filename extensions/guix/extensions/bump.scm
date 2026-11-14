@@ -32,7 +32,7 @@
   #:use-module (srfi srfi-1)
   #:export (guix-bump))
 
-(define %version "2.0")
+(define %version "2.1")
 
 ;; Replaced with a store file name when the package is built.
 (define %git "@GIT@")
@@ -599,13 +599,22 @@ The build farms usually catch up within a day or two.~%")
 ;;; Which installed packages have a newer version.
 ;;;
 
-;; Run by a Guix (`guix repl'): write ((NAME . VERSION) ...), the packages
+;; Run by a Guix (`guix repl'): write ((NAME VERSION CHANNEL) ...), the packages
 ;; of the home and of the system of the config file given first, to the file
 ;; given second.  It evaluates the config the way `guix home' and `guix
 ;; system' do, so each package is the one the config really names.
 (define %versions-script
-  "(use-modules (guix ui) (guix packages) (gnu home) (gnu system)
-             (ice-9 match) (srfi srfi-1))
+  "(use-modules (guix ui) (guix packages) (guix describe) (guix channels)
+             (gnu home) (gnu system) (ice-9 match) (srfi srfi-1))
+(define (entry p)
+  ;; `package-channels' names `guix' for every package: any other channel
+  ;; it names is the one the package is from.
+  (let ((channels (or (false-if-exception
+                       (map channel-name (package-channels p)))
+                      '())))
+    (list (package-name p) (package-version p)
+          (or (find (lambda (channel) (not (eq? channel 'guix))) channels)
+              'guix))))
 (match (reverse (command-line))
   ((out config . _)
    (let ((versions
@@ -615,10 +624,8 @@ The build farms usually catch up within a day or two.~%")
                  (filter-map
                   (lambda (item)
                     (match item
-                      ((? package? p)
-                       (cons (package-name p) (package-version p)))
-                      (((? package? p) . _)
-                       (cons (package-name p) (package-version p)))
+                      ((? package? p) (entry p))
+                      (((? package? p) . _) (entry p))
                       (_ #f)))
                   (packages (load* config '((guix profiles) (gnu))))))
                 '()))))
@@ -630,7 +637,7 @@ The build farms usually catch up within a day or two.~%")
 ")
 
 (define (config-versions guix text moved build-options)
-  ;; Return ((NAME . VERSION) ...) for the packages of the config TEXT, as
+  ;; Return ((NAME VERSION CHANNEL) ...) for the packages of the config TEXT, as
   ;; the pulled Guix has them or, when MOVED is not empty, as the Guix of
   ;; those pins, ((CHANNEL . COMMIT) ...), has them.  #f on failure.
   (let* ((dir     (state-directory))
@@ -705,10 +712,17 @@ pulled is shown.~%")
     (filter-map
      (match-lambda
        ((name version where)
-        (let ((pulled-version (assoc-ref pulled name))
-              (new            (assoc-ref newest name))
-              (channel        (match (available name)
-                                ((_ . channel) channel)
+        (let ((pulled-version (match (assoc name pulled)
+                                ((_ version . _) version)
+                                (_ #f)))
+              (new            (match (assoc name newest)
+                                ((_ version . _) version)
+                                (_ #f)))
+              ;; The channel of the package the config really names, which
+              ;; need not be the newest package of that name.
+              (channel        (match (or (assoc name pulled)
+                                         (assoc name newest))
+                                ((_ _ channel) channel)
                                 (_ "?"))))
           (cond ((and new (not (equal? new (or pulled-version version))))
                  (list name version new channel where #f))
@@ -1317,13 +1331,27 @@ the kernel or a driver changed.
   ;; Names that are not channels are apps (packages).
   (define home-before   (installed-in (home-profile)))
   (define system-before (installed-in %system-profile))
+  (define app-names
+    (if manage?
+        '()
+        (remove (lambda (name)
+                  (or (string=? name "all")
+                      (assq (string->symbol name) channels)))
+                names)))
+  ;; What the config installs, as the pulled Guix has it: the package of
+  ;; that name the config really uses, and the channel it is from.
+  (define configured
+    (if (null? app-names)
+        '()
+        (or (config-versions (pulled-guix) original '() build-options) '())))
   (define apps                          ;((NAME VERSION CHANNEL WHERE) ...)
     (filter-map
      (lambda (name)
-       (and (not manage?)
-            (not (string=? name "all"))
-            (not (assq (string->symbol name) channels))
-            (match (available name)
+       (and (member name app-names)
+            (match (or (match (assoc name configured)
+                         ((_ version channel) (cons version channel))
+                         (_ #f))
+                       (available name))
               ((version . channel)
                (unless (assq channel channels)
                  (die "~a comes from the channel '~a', which ~a doesn't pin"
