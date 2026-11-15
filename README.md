@@ -72,7 +72,8 @@ GUIX_EXTENSIONS_PATH=$PWD/extensions guix bump --help
   and `(specification->package "NAME")` calls are understood; what is added
   is written as `(specification->package "NAME")`. Any other expression is
   shown but never edited.
-- If the config is in a git repository, each change is committed and pushed.
+- If the config is in a git repository, each change is committed and pushed
+  (see *Keeping the config in git*).
 
 ## Settings
 
@@ -84,6 +85,7 @@ menu, *Settings*):
 | `config` | the config file | `~/config.scm` |
 | `packages` | the variable holding the list of package names | `%managed-packages`, else `%apps` |
 | `channels` | the variable holding the channels; only channels in its definition are updated | every channel in the file |
+| `git` | for a config in a git repository: `push` (commit each change and push it), `commit` (commit only) or `off` | `push` |
 
 ```sh
 guix bump --set config=~/dotfiles/guix.scm packages=%my-packages channels=%my-channels
@@ -92,6 +94,41 @@ guix bump --settings
 
 They are kept in `~/.config/guix-manager/settings`. The environment variable
 `GUIX_BUMP_CONFIG`, when set, comes before the `config` setting.
+
+## The window
+
+- The bar at the top: **Update apps** (newest versions, applied to your
+  home: no password, no logout), **Update system** (the same for the
+  system, with your password), **Apply apps** / **Apply system** (the config
+  file as it is now, after you edited it by hand).
+- **Updates**, **Install**, **Installed**: one app at a time.
+- Every button runs a `guix bump` command in the terminal pane, which also
+  shows the step it is on and the time so far.
+
+## Keeping the config in git
+
+Optional, and worth it: the repository's history becomes the history of the
+machine, and a broken change is one `git revert` away.
+
+1. Put the config in a repository, and make `~/config.scm` a link to it (or
+   set `config` to its path):
+
+   ```sh
+   mkdir ~/my-guix && mv ~/config.scm ~/my-guix/ && cd ~/my-guix
+   git init && git add config.scm && git commit -m "My Guix config"
+   ln -s ~/my-guix/config.scm ~/config.scm
+   ```
+
+2. To keep a copy online, add a remote you can push to without a password
+   prompt (with GitHub's `gh`: `gh repo create my-guix --private --source .
+   --push`, then `gh auth setup-git`).
+3. Choose what happens on each change (window: *Settings*):
+   `guix bump --set git=push` (the default; no remote, no push),
+   `git=commit`, or `git=off`.
+
+`guix bump` commits only the config file, with a message that says what
+changed ("Bump guix e2a7a34 -> 30fa7fb", "Install hello"). A failed push
+leaves the commit in place and says so; push later with `git push`.
 
 ## Limits
 

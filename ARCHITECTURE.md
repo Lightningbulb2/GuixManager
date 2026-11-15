@@ -101,7 +101,7 @@ resolved through symlinks first (its directory is where git runs).
 
 | Where | What |
 |---|---|
-| `~/.config/guix-manager/settings` | the three settings |
+| `~/.config/guix-manager/settings` | the settings (config, packages, channels, git) |
 | `~/.local/state/guix-bump/previous-pins.scm` | pins before the last change, for `--undo` |
 | `~/.local/state/guix-bump/*.log` | logs written with `--log` |
 | `~/.local/state/guix-bump/check-*` | temporary files of `--check`, deleted afterwards |

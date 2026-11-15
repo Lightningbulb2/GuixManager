@@ -33,7 +33,7 @@
   #:use-module (srfi srfi-1)
   #:export (guix-bump))
 
-(define %version "2.2")
+(define %version "2.3")
 
 ;; Replaced with a store file name when the package is built.
 (define %git "@GIT@")
@@ -57,11 +57,22 @@
 ;;;   channels  the variable holding the channels; only the (channel ...)
 ;;;             forms in its definition are pins  (default: every such form
 ;;;                                                in the file)
+;;;   git       what to do when the config is in a git repository:
+;;;             push (commit each change and push it), commit (commit
+;;;             only) or off                      (default push)
 ;;;
 ;;; `guix bump --settings' shows them, `guix bump --set KEY=VALUE' changes
 ;;; one, and an empty value goes back to the default.
 
-(define %setting-keys '("config" "packages" "channels"))
+(define %setting-keys '("config" "packages" "channels" "git"))
+
+(define (git-mode)
+  ;; 'push, 'commit or 'off.
+  (match (setting "git")
+    ((or #f "push") 'push)
+    ("commit" 'commit)
+    ("off" 'off)
+    (other (die "git = ~a: expected push, commit or off" other))))
 
 (define (settings-file)
   (string-append (or (getenv "XDG_CONFIG_HOME")
@@ -419,10 +430,12 @@ See `guix bump --help'.~%")
 
 (define (commit-config file message)
   ;; If FILE is in a git repository and differs from what is committed,
-  ;; commit it with MESSAGE and push.
+  ;; commit it with MESSAGE and, with the `git' setting at push (the
+  ;; default), push.
   (let ((dir  (dirname file))
         (name (basename file)))
-    (when (and (quietly (git) "-C" dir "rev-parse" "--is-inside-work-tree")
+    (when (and (not (eq? (git-mode) 'off))
+               (quietly (git) "-C" dir "rev-parse" "--is-inside-work-tree")
                (quietly (git) "-C" dir "add" "--" name)
                (not (quietly (git) "-C" dir "diff" "--cached" "--quiet"
                              "--" name)))
@@ -432,7 +445,8 @@ See `guix bump --help'.~%")
                   (car (string-split message #\newline)))
             ;; Never stop at a password prompt.
             (setenv "GIT_TERMINAL_PROMPT" "0")
-            (when (and (pair? (or (output-lines (git) "-C" dir "remote") '()))
+            (when (and (eq? (git-mode) 'push)
+                       (pair? (or (output-lines (git) "-C" dir "remote") '()))
                        (not (quietly (git) "-C" dir "push")))
               (emit "Could not push ~a; run `git -C ~a push' later.~%"
                     name dir)))
@@ -1290,7 +1304,30 @@ there" name file))
                              (setting "channels")))
                     (else
                      (format #f "~a channels (every channel in the file)"
-                             channels)))))))
+                             channels))))
+            ("git" ,(or (setting "git") "")
+             ,(let* ((dir  (dirname file))
+                     (repo (and text
+                                (quietly (git) "-C" dir "rev-parse"
+                                         "--is-inside-work-tree")))
+                     (remote (and repo
+                                  (match (output-lines (git) "-C" dir
+                                                       "remote" "get-url"
+                                                       "--push" "origin")
+                                    ((url . _) url)
+                                    (_ #f)))))
+                (cond ((not repo)
+                       "the config is not in a git repository: nothing to do")
+                      ((eq? (git-mode) 'off)
+                       "changes are not committed")
+                      ((eq? (git-mode) 'commit)
+                       (format #f "each change is committed in ~a" dir))
+                      (remote
+                       (format #f "each change is committed and pushed to ~a"
+                               remote))
+                      (else
+                       (format #f "each change is committed in ~a (no remote to push to)"
+                               dir))))))))
     (for-each (match-lambda
                 ((key value effective)
                  (if %porcelain?
@@ -1322,7 +1359,10 @@ show each channel's pinned, running and latest commit.
   guix bump --settings            show which file and lists are used
   guix bump --set KEY=VALUE...    change that: config=FILE, packages=VARIABLE
                                   (the list --install edits), channels=VARIABLE
-                                  (the list of channels); empty = default
+                                  (the list of channels), git=push|commit|off
+                                  (for a config in a git repository: commit
+                                  and push each change, commit only, or
+                                  neither); empty = default
   guix bump APP        update that app now: move the pin of the channel it
                        comes from, pull, and apply the home (or the system,
                        if that is where the app is installed)
@@ -1359,7 +1399,8 @@ installs.  Packages the config names in another way are not touched.
 
 The config file is $GUIX_BUMP_CONFIG, else the `config' setting, else
 ~/config.scm.  Settings are in ~/.config/guix-manager/settings.  If it is in a git
-repository, every change that was pulled or applied is committed and pushed.
+repository, every change that was pulled or applied is committed and pushed
+(the `git' setting: push, commit or off).
 Environment: GUIX_BUMP_KEEP (1m), GUIX_BUMP_FREE (100G), GUIX_BUMP_HEAVY
 (regexp of slow package names).
 
@@ -1437,6 +1478,11 @@ the kernel or a driver changed.
                    (unless (member key %setting-keys)
                      (die "~a: no such setting; there are: ~a" key
                           (string-join %setting-keys ", ")))
+                   (when (and (string=? key "git")
+                              (not (member (substring pair (+ i 1))
+                                           '("" "push" "commit" "off"))))
+                     (die "git=~a: expected push, commit or off"
+                          (substring pair (+ i 1))))
                    (cons key (substring pair (+ i 1)))))))
           names)))
   (when (or set? settings?)

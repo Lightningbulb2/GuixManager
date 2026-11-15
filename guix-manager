@@ -22,7 +22,7 @@ gi.require_version("Vte", "3.91")
 from gi.repository import Adw, Gio, GLib, Gtk, Pango, Vte  # noqa: E402
 
 APP_ID = "io.github.lightningbulb2.GuixManager"
-VERSION = "2.2"
+VERSION = "2.3"
 
 
 def guix():
@@ -167,9 +167,53 @@ class Window(Adw.ApplicationWindow):
         body.append(self.revealer)
         view = Adw.ToolbarView(content=body)
         view.add_top_bar(header)
+        view.add_top_bar(self.build_actions())
         self.set_content(view)
 
         self.refresh()
+
+    # -- the bar of whole-machine actions --------------------------------
+
+    def build_actions(self):
+        """Buttons for what applies to the whole machine: update everything
+        (move the pins, pull, apply) or apply the config as it is, for your
+        apps (home) or the system."""
+        actions = (
+            ("Update apps", "software-update-available-symbolic",
+             "Get the newest versions and install them in your apps (home). "
+             "No password, no logout.",
+             lambda: self.run(["bump", "all", "--home"],
+                              "Updating everything and applying it to your "
+                              "apps.")),
+            ("Update system", "system-software-update-symbolic",
+             "Get the newest versions and apply them to the system, which "
+             "includes your apps when the config says so.  Asks for your "
+             "password; kernel and driver changes need a reboot.",
+             lambda: self.run(["bump", "all", "--system", "--home"],
+                              "Updating everything and applying it to the "
+                              "system.")),
+            ("Apply apps", "emblem-ok-symbolic",
+             "Install what the config file says now in your apps (home), "
+             "without updating anything (after editing the file by hand).",
+             lambda: self.run(["bump", "--home"],
+                              "Applying the config file to your apps.")),
+            ("Apply system", "computer-symbolic",
+             "Apply the config file to the system as it is now, without "
+             "updating anything.  Asks for your password.",
+             lambda: self.run(["bump", "--system"],
+                              "Applying the config file to the system.")),
+        )
+        bar = Gtk.Box(spacing=6, margin_start=12, margin_end=12,
+                      margin_top=6, margin_bottom=6,
+                      halign=Gtk.Align.CENTER)
+        self.action_buttons = []
+        for label, icon, tooltip, callback in actions:
+            content = Adw.ButtonContent(label=label, icon_name=icon)
+            button = Gtk.Button(child=content, tooltip_text=tooltip)
+            button.connect("clicked", lambda _b, f=callback: f())
+            bar.append(button)
+            self.action_buttons.append(button)
+        return bar
 
     # -- building the pages ----------------------------------------------
 
@@ -236,6 +280,13 @@ class Window(Adw.ApplicationWindow):
             margin_top=12, margin_bottom=6, margin_start=12, margin_end=12)
         self.filter_entry.connect("search-changed",
                                   lambda *_: self.fill_installed())
+        # Shown when the package list of the settings is not in the config.
+        self.list_banner = Adw.Banner(
+            title="Your config file has no package list by the name in "
+                  "Settings, so nothing here can be changed.",
+            button_label="Settings")
+        self.list_banner.connect("button-clicked",
+                                 lambda *_: self.show_settings())
         mine = Adw.PreferencesGroup(
             title="Your apps",
             description="The package list of your config file.  Remove one, "
@@ -252,6 +303,7 @@ class Window(Adw.ApplicationWindow):
         page.add(mine)
         page.add(other)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.append(self.list_banner)
         box.append(self.filter_entry)
         box.append(page)
         return box
@@ -268,6 +320,8 @@ class Window(Adw.ApplicationWindow):
     def refresh_sensitivity(self):
         free = not self.busy
         self.refresh_button.set_sensitive(free and not self.checking)
+        for button in getattr(self, "action_buttons", []):
+            button.set_sensitive(free)
         self.all_button.set_sensitive(
             free and bool(self.packages or self.channels))
         for rows in (self.update_rows, self.source_rows, self.result_rows,
@@ -477,6 +531,23 @@ class Window(Adw.ApplicationWindow):
 
     def load_installed(self):
         self.query(["--installed"], self.installed_done)
+        self.query(["--settings"], self.settings_done)
+
+    def settings_done(self, lines):
+        """Say so when the package list of the settings can't be found."""
+        missing = False
+        for line in lines or []:
+            fields = line.split("\t")
+            if fields[0] == "setting" and len(fields) == 4 \
+                    and fields[1] == "packages":
+                missing = fields[3].startswith("no (define")
+                if missing:
+                    self.list_banner.set_title(
+                        "Your config file has no package list called "
+                        f"{fields[2] or '%managed-packages'}, so nothing "
+                        "here can be changed.  Name the list it has in "
+                        "Settings.")
+        self.list_banner.set_revealed(missing)
 
     def installed_done(self, lines):
         if lines is None:
@@ -692,7 +763,8 @@ class Window(Adw.ApplicationWindow):
         def show(lines):
             for line in lines or []:
                 fields = line.split("\t")
-                if fields[0] == "setting" and len(fields) == 4:
+                if fields[0] == "setting" and len(fields) == 4 \
+                        and fields[1] in rows:
                     entry, effect, note = rows[fields[1]]
                     if entry.get_text() != fields[2]:
                         entry.set_text(fields[2])
@@ -704,6 +776,47 @@ class Window(Adw.ApplicationWindow):
                 show(lines)
                 self.refresh()
             self.query(["--set", f"{key}={value}"], changed)
+
+        # What to do with a config kept in git.
+        git_group = Adw.PreferencesGroup(
+            title="Keeping the config file in git",
+            description="When the config file is in a git repository, each "
+                        "change Guix Manager makes can be committed, and "
+                        "pushed to the repository's remote (for example "
+                        "GitHub), so its history is the machine's history.")
+        modes = ["push", "commit", "off"]
+        labels = ["Commit and push each change", "Commit only",
+                  "Don't use git"]
+        git_row = Adw.ComboRow(title="Changes",
+                               model=Gtk.StringList.new(labels))
+        git_effect = Adw.ActionRow(title="")
+        git_effect.add_css_class("property")
+        git_group.add(git_row)
+        git_group.add(git_effect)
+        page.add(git_group)
+        updating = {"now": False}
+
+        def git_chosen(row, _param):
+            if not updating["now"]:
+                change("git", modes[row.get_selected()])
+        git_row.connect("notify::selected", git_chosen)
+
+        def show_git(lines):
+            for line in lines or []:
+                fields = line.split("\t")
+                if fields[0] == "setting" and len(fields) == 4 \
+                        and fields[1] == "git":
+                    updating["now"] = True
+                    git_row.set_selected(modes.index(fields[2])
+                                         if fields[2] in modes else 0)
+                    updating["now"] = False
+                    git_effect.set_subtitle(escape("Now: " + fields[3]))
+
+        shown = show
+
+        def show(lines):              # noqa: F811 (both parts)
+            shown(lines)
+            show_git(lines)
 
         dialog.add(page)
         self.query(["--settings"], show)

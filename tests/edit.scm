@@ -168,4 +168,9 @@
        ((f 'read-settings))
        '())
 
+((f 'write-setting!) "git" "commit")
+(check "git setting" ((f 'git-mode)) 'commit)
+((f 'write-setting!) "git" "")
+(check "git setting default" ((f 'git-mode)) 'push)
+
 (exit (if (zero? failures) 0 1))
