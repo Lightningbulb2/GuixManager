@@ -48,7 +48,7 @@ output carries tab-separated lines, ending with `done`:
 | `package` | name, installed, newest, channel, `home`/`system`, `pulled`/`new` | `--check` |
 | `result` | name, version, `installed`/`-`, synopsis | `--search` |
 | `installed` | name, version, `list`/`config`, spec or `-`, versions (comma-separated) | `--installed` |
-| `setting` | key, value (may be empty), what is in effect | `--settings`, `--set` |
+| `setting` | key, value (may be empty), what is in effect; `git-remote`, `git-name`, `git-email` are read from and written to the config's git repository | `--settings`, `--set` |
 
 A missing `done` means the command failed. Add fields at the end only; the
 window ignores lines it does not know.
@@ -101,7 +101,7 @@ resolved through symlinks first (its directory is where git runs).
 
 | Where | What |
 |---|---|
-| `~/.config/guix-manager/settings` | the settings (config, packages, channels, git) |
+| `~/.config/guix-manager/settings` | the settings (config, packages, channels, git); the git remote and identity live in the config's repository |
 | `~/.local/state/guix-bump/previous-pins.scm` | pins before the last change, for `--undo` |
 | `~/.local/state/guix-bump/*.log` | logs written with `--log` |
 | `~/.local/state/guix-bump/check-*` | temporary files of `--check`, deleted afterwards |

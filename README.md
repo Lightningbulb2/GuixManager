@@ -86,6 +86,8 @@ menu, *Settings*):
 | `packages` | the variable holding the list of package names | `%managed-packages`, else `%apps` |
 | `channels` | the variable holding the channels; only channels in its definition are updated | every channel in the file |
 | `git` | for a config in a git repository: `push` (commit each change and push it), `commit` (commit only) or `off` | `push` |
+| `git-remote` | where changes are pushed: the config repository's `origin` (empty removes it) | as the repository has it |
+| `git-name`, `git-email` | who the commits are by: the repository's `user.name` / `user.email` | your global git settings |
 
 ```sh
 guix bump --set config=~/dotfiles/guix.scm packages=%my-packages channels=%my-channels
@@ -102,8 +104,15 @@ They are kept in `~/.config/guix-manager/settings`. The environment variable
   system, with your password), **Apply apps** / **Apply system** (the config
   file as it is now, after you edited it by hand).
 - **Updates**, **Install**, **Installed**: one app at a time.
-- Every button runs a `guix bump` command in the terminal pane, which also
-  shows the step it is on and the time so far.
+- Every button runs a `guix bump` command in the terminal pane; hover a
+  button to see the command it runs.
+- The strip under the buttons always shows what is running (or what
+  happened last), its current step and latest line, the time so far and a
+  bar. **Cancel** stops it as Ctrl-C would; a command stopped halfway
+  switches nothing and puts the config file back.
+- Drag the line above the terminal to give it more or less room (menu:
+  show or hide it).
+- The folder button opens the folder of your config file.
 
 ## Keeping the config in git
 

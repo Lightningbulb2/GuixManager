@@ -33,7 +33,7 @@
   #:use-module (srfi srfi-1)
   #:export (guix-bump))
 
-(define %version "2.3")
+(define %version "2.4")
 
 ;; Replaced with a store file name when the package is built.
 (define %git "@GIT@")
@@ -61,10 +61,67 @@
 ;;;             push (commit each change and push it), commit (commit
 ;;;             only) or off                      (default push)
 ;;;
+;;; and three that live in the config's git repository itself, not in that
+;;; file, shown and changed the same way:
+;;;
+;;;   git-remote  where changes are pushed (the remote `origin'); empty
+;;;               removes it
+;;;   git-name, git-email  who the commits are by (the repository's
+;;;               user.name and user.email); empty falls back to the
+;;;               global git configuration
+;;;
 ;;; `guix bump --settings' shows them, `guix bump --set KEY=VALUE' changes
 ;;; one, and an empty value goes back to the default.
 
 (define %setting-keys '("config" "packages" "channels" "git"))
+
+(define %git-keys '("git-remote" "git-name" "git-email"))
+
+(define (config-repository)
+  ;; The directory of the config file, if it is in a git repository.
+  (let ((dir (dirname (config-file))))
+    (and (file-exists? dir)
+         (quietly (git) "-C" dir "rev-parse" "--is-inside-work-tree")
+         dir)))
+
+(define (git-value dir key)
+  ;; The value of the git setting KEY in the repository DIR, or "".
+  (match (output-lines (git) "-C" dir
+                       (if (string=? key "git-remote") "remote" "config")
+                       (match key
+                         ("git-remote" "get-url")
+                         (_ "--get"))
+                       (match key
+                         ("git-remote" "origin")
+                         ("git-name" "user.name")
+                         ("git-email" "user.email")))
+    ((value . _) value)
+    (_ "")))
+
+(define (set-git-value! key value)
+  ;; Change the git setting KEY of the config's repository to VALUE.
+  (let ((dir (or (config-repository)
+                 (die "~a is not in a git repository" (config-file)))))
+    (define (git! . args)
+      (unless (apply quietly (git) "-C" dir args)
+        (die "git ~a failed in ~a" (string-join args " ") dir)))
+    (match key
+      ("git-remote"
+       (let ((has-origin? (member "origin"
+                                  (or (output-lines (git) "-C" dir "remote")
+                                      '()))))
+         (cond ((string-null? value)
+                (when has-origin? (git! "remote" "remove" "origin")))
+               (has-origin? (git! "remote" "set-url" "origin" value))
+               (else (git! "remote" "add" "origin" value)))))
+      (_
+       (let ((variable (if (string=? key "git-name") "user.name"
+                           "user.email")))
+         (if (string-null? value)
+             ;; Exit status 5: it was not set.
+             (apply quietly (git) "-C" dir
+                    (list "config" "--unset" variable))
+             (git! "config" variable value)))))))
 
 (define (git-mode)
   ;; 'push, 'commit or 'off.
@@ -1327,7 +1384,34 @@ there" name file))
                                remote))
                       (else
                        (format #f "each change is committed in ~a (no remote to push to)"
-                               dir))))))))
+                               dir)))))
+            ,@(let ((dir (and text (config-repository))))
+                (map (lambda (key)
+                       (if dir
+                           (let ((value (git-value dir key)))
+                             (list key value
+                                   (match key
+                                     ("git-remote"
+                                      (if (string-null? value)
+                                          "no remote: changes are not pushed"
+                                          (format #f "pushed to ~a" value)))
+                                     (_
+                                      (if (string-null? value)
+                                          (let ((global
+                                                 (match (output-lines
+                                                         (git) "config" "--global"
+                                                         (if (string=? key "git-name")
+                                                             "user.name"
+                                                             "user.email"))
+                                                   ((v . _) v)
+                                                   (_ #f))))
+                                            (if global
+                                                (format #f "~a (your global git setting)"
+                                                        global)
+                                                "not set: git will refuse to commit"))
+                                          value)))))
+                           (list key "" "the config is not in a git repository")))
+                     %git-keys)))))
     (for-each (match-lambda
                 ((key value effective)
                  (if %porcelain?
@@ -1362,7 +1446,10 @@ show each channel's pinned, running and latest commit.
                                   (the list of channels), git=push|commit|off
                                   (for a config in a git repository: commit
                                   and push each change, commit only, or
-                                  neither); empty = default
+                                  neither); empty = default.  In the config's
+                                  repository: git-remote=URL (where to push;
+                                  empty removes it), git-name=, git-email=
+                                  (who commits)
   guix bump APP        update that app now: move the pin of the channel it
                        comes from, pull, and apply the home (or the system,
                        if that is where the app is installed)
@@ -1470,14 +1557,19 @@ the kernel or a driver changed.
     ;; Check them all before changing any.
     (for-each
      (match-lambda
-       ((key . value) (write-setting! key value)))
+       ((key . value)
+        (if (member key %git-keys)
+            (set-git-value! key value)
+            (write-setting! key value))))
      (map (lambda (pair)
             (match (string-index pair #\=)
               (#f (die "~a: expected KEY=VALUE" pair))
               (i (let ((key (substring pair 0 i)))
-                   (unless (member key %setting-keys)
+                   (unless (or (member key %setting-keys)
+                               (member key %git-keys))
                      (die "~a: no such setting; there are: ~a" key
-                          (string-join %setting-keys ", ")))
+                          (string-join (append %setting-keys %git-keys)
+                                       ", ")))
                    (when (and (string=? key "git")
                               (not (member (substring pair (+ i 1))
                                            '("" "push" "commit" "off"))))

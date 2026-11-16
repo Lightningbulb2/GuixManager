@@ -11,6 +11,8 @@ itself: all the logic is in `guix bump'.
 """
 
 import os
+import shutil
+import signal
 import sys
 import time
 
@@ -22,13 +24,24 @@ gi.require_version("Vte", "3.91")
 from gi.repository import Adw, Gio, GLib, Gtk, Pango, Vte  # noqa: E402
 
 APP_ID = "io.github.lightningbulb2.GuixManager"
-VERSION = "2.3"
+VERSION = "2.4"
 
 
 def guix():
     """The `guix' to run: the one `guix pull' maintains, else the PATH's."""
     pulled = os.path.expanduser("~/.config/guix/current/bin/guix")
     return pulled if os.path.exists(pulled) else "guix"
+
+
+def command_text(arguments):
+    """ARGUMENTS of `guix' as a person would type them."""
+    return "guix " + " ".join(arguments)
+
+
+def runs(arguments, what=""):
+    """A tooltip: WHAT a button does, then the command it runs."""
+    command = command_text(arguments)
+    return f"{what}\n\nRuns: {command}" if what else f"Runs: {command}"
 
 
 def short(commit):
@@ -74,6 +87,11 @@ class Window(Adw.ApplicationWindow):
         self.set_default_size(820, 760)
         self.busy = False          # a command is running in the terminal
         self.checking = False
+        self.child_pid = None      # that command's process
+        self.cancelling = False
+        self.queries = {}          # background `guix bump' runs: label
+        self.config_path = None    # from `guix bump --settings'
+        self.last_outcome = "Ready"
         self.packages = []         # rows of the last update check
         self.channels = []
         self.installed = []        # rows of the last `--installed'
@@ -92,8 +110,16 @@ class Window(Adw.ApplicationWindow):
             "view-list-symbolic")
 
         # Header: the page switcher, look again, more.
-        self.refresh_button = Gtk.Button(icon_name="view-refresh-symbolic",
-                                         tooltip_text="Look again")
+        self.refresh_button = Gtk.Button(
+            icon_name="view-refresh-symbolic",
+            tooltip_text="Look again for updates and installed apps\n\n"
+                         "Runs: guix bump --check, guix bump --installed "
+                         "(with --porcelain: output for this window)")
+        self.folder_button = Gtk.Button(
+            icon_name="folder-open-symbolic",
+            tooltip_text="Open the folder of your config file")
+        self.folder_button.connect("clicked",
+                                   lambda *_: self.open_config_folder())
         self.refresh_button.connect("clicked", lambda *_: self.refresh())
         menu = Gio.Menu()
         menu.append("Update everything, then power off", "win.nightly")
@@ -111,6 +137,7 @@ class Window(Adw.ApplicationWindow):
             title_widget=Adw.ViewSwitcher(
                 stack=self.pages, policy=Adw.ViewSwitcherPolicy.WIDE))
         header.pack_start(self.refresh_button)
+        header.pack_start(self.folder_button)
         header.pack_end(Gtk.MenuButton(icon_name="open-menu-symbolic",
                                        menu_model=menu))
 
@@ -124,53 +151,163 @@ class Window(Adw.ApplicationWindow):
                               margin_bottom=6, wrap=True)
         self.hint.add_css_class("dim-label")
 
-        # What is happening right now, while a command runs: a spinner, the
-        # step, the latest line of output, the time so far and a moving bar.
+        pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        pane.append(self.hint)
+        pane.append(Gtk.ScrolledWindow(child=self.terminal, vexpand=True,
+                                       min_content_height=80))
+        pane.set_visible(False)
+        self.terminal_pane = pane
+
+        # The pages above, the terminal below; drag the line between them.
+        self.toasts = Adw.ToastOverlay(child=self.pages)
+        self.paned = Gtk.Paned(orientation=Gtk.Orientation.VERTICAL,
+                               start_child=self.toasts, end_child=pane,
+                               resize_start_child=True,
+                               resize_end_child=False,
+                               shrink_start_child=False,
+                               shrink_end_child=False,
+                               wide_handle=True)
+        self.terminal_height = 260
+        view = Adw.ToolbarView(content=self.paned)
+        view.add_top_bar(header)
+        view.add_top_bar(self.build_actions())
+        view.add_top_bar(self.build_status())
+        self.set_content(view)
+
+        self.refresh()
+
+    # -- the status strip: what is happening, always shown ---------------
+
+    def build_status(self):
+        """A strip under the buttons: what is running (or what happened
+        last), the step it is on, its latest line of output, the time so
+        far, a bar, and Cancel."""
+        self.work_icon = Gtk.Image(icon_name="emblem-ok-symbolic")
         self.work_spinner = Gtk.Spinner()
-        self.work_spinner.set_size_request(24, 24)
+        self.work_indicator = Gtk.Stack()
+        self.work_indicator.add_named(self.work_icon, "idle")
+        self.work_indicator.add_named(self.work_spinner, "busy")
+        self.work_indicator.set_size_request(20, 20)
         self.work_step = Gtk.Label(xalign=0, hexpand=True,
-                                   ellipsize=Pango.EllipsizeMode.END)
+                                   ellipsize=Pango.EllipsizeMode.END,
+                                   label="Ready")
         self.work_step.add_css_class("heading")
         self.work_time = Gtk.Label(xalign=1)
         self.work_time.add_css_class("numeric")
         self.work_time.add_css_class("dim-label")
+        self.cancel_button = Gtk.Button(
+            label="Cancel", sensitive=False,
+            tooltip_text="Stop what is running, as Ctrl-C in a terminal "
+                         "would.  A command stopped halfway switches "
+                         "nothing: the config file is put back.")
+        self.cancel_button.add_css_class("destructive-action")
+        self.cancel_button.connect("clicked", lambda *_: self.cancel())
         top = Gtk.Box(spacing=10)
-        top.append(self.work_spinner)
+        top.append(self.work_indicator)
         top.append(self.work_step)
         top.append(self.work_time)
-        self.work_line = Gtk.Label(xalign=0,
+        top.append(self.cancel_button)
+        self.work_line = Gtk.Label(xalign=0, label="Nothing is running.",
                                    ellipsize=Pango.EllipsizeMode.MIDDLE)
         self.work_line.add_css_class("dim-label")
         self.work_line.add_css_class("caption")
         self.work_bar = Gtk.ProgressBar()
-        work = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
-                       margin_start=12, margin_end=12, margin_top=10,
-                       margin_bottom=4)
-        work.append(top)
-        work.append(self.work_line)
-        work.append(self.work_bar)
-        self.work = Gtk.Revealer(child=work)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4,
+                      margin_start=12, margin_end=12, margin_top=4,
+                      margin_bottom=8)
+        box.append(top)
+        box.append(self.work_line)
+        box.append(self.work_bar)
         self.work_started = 0
-        self.work_timer = None
+        GLib.timeout_add(250, self.tick)
+        return box
 
-        pane = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        pane.append(Gtk.Separator())
-        pane.append(self.work)
-        pane.append(self.hint)
-        pane.append(Gtk.ScrolledWindow(child=self.terminal,
-                                       min_content_height=230))
-        self.revealer = Gtk.Revealer(child=pane)
+    def tick(self):
+        """Every quarter second: the time so far and the moving bar."""
+        if self.busy or self.queries:
+            seconds = int(time.monotonic() - self.work_started)
+            self.work_time.set_text(f"{seconds // 60}:{seconds % 60:02d}")
+            self.work_bar.pulse()
+        return True
 
-        self.toasts = Adw.ToastOverlay(child=self.pages)
-        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-        body.append(self.toasts)
-        body.append(self.revealer)
-        view = Adw.ToolbarView(content=body)
-        view.add_top_bar(header)
-        view.add_top_bar(self.build_actions())
-        self.set_content(view)
+    def show_state(self):
+        """Put what is running now, or what happened last, in the strip."""
+        running = self.busy or bool(self.queries)
+        self.cancel_button.set_sensitive(running and not self.cancelling)
+        if running:
+            self.work_indicator.set_visible_child_name("busy")
+            self.work_spinner.start()
+            if not self.busy:
+                self.work_step.set_text(
+                    "  ·  ".join(dict.fromkeys(self.queries.values())))
+            self.set_title(f"Guix Manager: {self.work_step.get_text()}")
+        else:
+            self.work_spinner.stop()
+            self.work_indicator.set_visible_child_name("idle")
+            self.work_step.set_text(self.last_outcome)
+            self.set_title("Guix Manager")
 
-        self.refresh()
+    def begin(self):
+        """Something starts: restart the clock if nothing else runs."""
+        if not (self.busy or self.queries):
+            self.work_started = time.monotonic()
+            self.work_time.set_text("0:00")
+            self.work_bar.set_fraction(0)
+
+    def finish(self, outcome, icon, fraction):
+        """Something ended: say how, once nothing else runs."""
+        self.last_outcome = outcome
+        self.work_icon.set_from_icon_name(icon)
+        if not (self.busy or self.queries):
+            self.work_bar.set_fraction(fraction)
+        self.show_state()
+
+    def cancel(self):
+        """Stop the running command and the background queries."""
+        self.cancelling = True
+        self.cancel_button.set_sensitive(False)
+        self.work_line.set_text("Stopping…")
+        for process in list(self.queries):
+            self.signal_group(process.get_identifier(), signal.SIGTERM)
+        if self.busy:
+            # Ctrl-C, as typed in the terminal: every process of the
+            # command gets SIGINT, and `guix bump' cleans up after itself.
+            try:
+                self.terminal.feed_child(b"\x03")
+            except TypeError:
+                self.terminal.feed_child("\x03", 1)
+
+            def force():
+                if self.busy and self.child_pid:
+                    self.signal_group(self.child_pid, signal.SIGTERM)
+                return False
+            GLib.timeout_add_seconds(10, force)
+        if not self.busy:
+            self.cancelling = False
+
+    @staticmethod
+    def signal_group(pid, sig):
+        if not pid:
+            return
+        try:
+            os.killpg(os.getpgid(int(pid)), sig)
+        except (ProcessLookupError, PermissionError, ValueError):
+            pass
+
+    # -- the config file's folder ----------------------------------------
+
+    def open_config_folder(self):
+        if not self.config_path:
+            self.toast("The config file isn't known yet")
+            return
+        file = Gio.File.new_for_path(self.config_path)
+        try:
+            Gtk.FileLauncher.new(file).open_containing_folder(
+                self, None, None)
+        except (AttributeError, TypeError):
+            Gio.AppInfo.launch_default_for_uri(
+                Gio.File.new_for_path(os.path.dirname(self.config_path))
+                .get_uri(), None)
 
     # -- the bar of whole-machine actions --------------------------------
 
@@ -182,35 +319,35 @@ class Window(Adw.ApplicationWindow):
             ("Update apps", "software-update-available-symbolic",
              "Get the newest versions and install them in your apps (home). "
              "No password, no logout.",
-             lambda: self.run(["bump", "all", "--home"],
-                              "Updating everything and applying it to your "
-                              "apps.")),
+             ["bump", "all", "--home"],
+             "Updating everything and applying it to your apps."),
             ("Update system", "system-software-update-symbolic",
              "Get the newest versions and apply them to the system, which "
              "includes your apps when the config says so.  Asks for your "
              "password; kernel and driver changes need a reboot.",
-             lambda: self.run(["bump", "all", "--system", "--home"],
-                              "Updating everything and applying it to the "
-                              "system.")),
+             ["bump", "all", "--system", "--home"],
+             "Updating everything and applying it to the system."),
             ("Apply apps", "emblem-ok-symbolic",
              "Install what the config file says now in your apps (home), "
              "without updating anything (after editing the file by hand).",
-             lambda: self.run(["bump", "--home"],
-                              "Applying the config file to your apps.")),
+             ["bump", "--home"],
+             "Applying the config file to your apps."),
             ("Apply system", "computer-symbolic",
              "Apply the config file to the system as it is now, without "
              "updating anything.  Asks for your password.",
-             lambda: self.run(["bump", "--system"],
-                              "Applying the config file to the system.")),
+             ["bump", "--system"],
+             "Applying the config file to the system."),
         )
         bar = Gtk.Box(spacing=6, margin_start=12, margin_end=12,
                       margin_top=6, margin_bottom=6,
                       halign=Gtk.Align.CENTER)
         self.action_buttons = []
-        for label, icon, tooltip, callback in actions:
+        for label, icon, what, arguments, hint in actions:
             content = Adw.ButtonContent(label=label, icon_name=icon)
-            button = Gtk.Button(child=content, tooltip_text=tooltip)
-            button.connect("clicked", lambda _b, f=callback: f())
+            button = Gtk.Button(child=content,
+                                tooltip_text=runs(arguments, what))
+            button.connect("clicked",
+                           lambda _b, a=arguments, h=hint: self.run(a, h))
             bar.append(button)
             self.action_buttons.append(button)
         return bar
@@ -320,6 +457,7 @@ class Window(Adw.ApplicationWindow):
     def refresh_sensitivity(self):
         free = not self.busy
         self.refresh_button.set_sensitive(free and not self.checking)
+        self.show_state()
         for button in getattr(self, "action_buttons", []):
             button.set_sensitive(free)
         self.all_button.set_sensitive(
@@ -328,37 +466,72 @@ class Window(Adw.ApplicationWindow):
                      self.mine_rows):
             rows.set_sensitive(free)
 
+    def show_terminal(self, shown=True):
+        if shown and not self.terminal_pane.get_visible():
+            self.terminal_pane.set_visible(True)
+            # Room for the terminal, unless the window is too short.
+            height = self.paned.get_height()
+            if height > 0:
+                self.paned.set_position(
+                    max(height // 3, height - self.terminal_height))
+        elif not shown and self.terminal_pane.get_visible():
+            self.terminal_height = (self.paned.get_height()
+                                    - self.paned.get_position())
+            self.terminal_pane.set_visible(False)
+
     def toggle_details(self):
-        self.revealer.set_reveal_child(not self.revealer.get_reveal_child())
+        self.show_terminal(not self.terminal_pane.get_visible())
 
     def say(self, text):
         """Write a line of our own into the terminal pane."""
         self.terminal.feed(("\r\n\x1b[1m" + text + "\x1b[0m\r\n").encode())
 
-    def query(self, arguments, done):
+    def query(self, arguments, done, label=None):
         """Run `guix bump ARGUMENTS --porcelain' in the background; call
         DONE with its lines of output, or None if it failed.  What it says
-        for people goes to the terminal pane."""
-        self.say("$ guix bump " + " ".join(arguments))
+        for people goes to the terminal pane.  With LABEL, it shows in the
+        status strip and Cancel stops it."""
+        if not self.busy:
+            self.say("$ guix bump " + " ".join(arguments))
+        argv = [guix(), "bump"] + arguments + ["--porcelain"]
+        # Its own process group, so that Cancel reaches what it starts.
+        if label and shutil.which("setsid"):
+            argv = [shutil.which("setsid")] + argv
         try:
             process = Gio.Subprocess.new(
-                [guix(), "bump"] + arguments + ["--porcelain"],
-                Gio.SubprocessFlags.STDOUT_PIPE
+                argv, Gio.SubprocessFlags.STDOUT_PIPE
                 | Gio.SubprocessFlags.STDERR_PIPE)
         except GLib.Error as error:
             self.terminal.feed((error.message + "\r\n").encode())
             done(None)
             return
         lines = []
+        if label:
+            self.begin()
+            self.queries[process] = label
+            self.show_state()
 
         def finished(process, result):
+            cancelled = self.cancelling and process in self.queries
+            self.queries.pop(process, None)
             try:
                 process.wait_finish(result)
+                ok = process.get_successful() and "done" in lines
             except GLib.Error:
-                done(None)
-                return
-            ok = process.get_successful() and "done" in lines
-            done(lines if ok else None)
+                ok = False
+            if label:
+                if cancelled:
+                    self.finish(f"{label}: cancelled",
+                                "process-stop-symbolic", 0)
+                elif ok:
+                    self.finish(f"{label}: done", "emblem-ok-symbolic", 1)
+                else:
+                    self.finish(f"{label}: failed (see the terminal)",
+                                "dialog-warning-symbolic", 0)
+                if not (self.busy or self.queries):
+                    self.cancelling = False
+                    self.show_state()
+            done(lines if ok and not cancelled else None)
 
         def read(stream, keep):
             def on_line(source, result):
@@ -372,8 +545,12 @@ class Window(Adw.ApplicationWindow):
                     return
                 if keep:
                     lines.append(line)
-                else:
+                elif not self.busy:
+                    # While a command runs, the terminal and the strip are
+                    # its own: a background query doesn't write there.
                     self.terminal.feed((line + "\r\n").encode())
+                    if label and line.strip():
+                        self.work_line.set_text(line.strip())
                 read(stream, keep)
             stream.read_line_async(GLib.PRIORITY_DEFAULT, None, on_line)
 
@@ -407,7 +584,7 @@ class Window(Adw.ApplicationWindow):
             "The first look after new commits prepares the newer Guix, "
             "which can take several minutes.  Later ones take seconds.",
             working=True)
-        self.query(["--check"], self.check_done)
+        self.query(["--check"], self.check_done, "Looking for updates")
 
     def check_done(self, lines):
         self.checking = False
@@ -416,7 +593,7 @@ class Window(Adw.ApplicationWindow):
                 "dialog-warning-symbolic", "Could not look for updates",
                 "`guix bump --check' failed; the reason is in the terminal "
                 "below.")
-            self.revealer.set_reveal_child(True)
+            self.show_terminal()
             self.refresh_sensitivity()
             return
         self.packages, self.channels = [], []
@@ -432,8 +609,8 @@ class Window(Adw.ApplicationWindow):
                     name=fields[1], pinned=fields[2], latest=fields[3]))
         self.fill_updates()
 
-    def button(self, label, callback, style=None):
-        button = Gtk.Button(label=label)
+    def button(self, label, callback, style=None, tooltip=None):
+        button = Gtk.Button(label=label, tooltip_text=tooltip)
         if style:
             button.add_css_class(style)
         button.connect("clicked", lambda *_: callback())
@@ -456,7 +633,10 @@ class Window(Adw.ApplicationWindow):
                 notes.append("updates everything from Guix")
             self.update_rows.add(
                 package["name"], "  ·  ".join(notes),
-                [self.button("Update", lambda p=package: self.update_app(p))])
+                [self.button("Update", lambda p=package: self.update_app(p),
+                             tooltip=runs(self.update_app_arguments(package)))])
+        self.all_button.set_tooltip_text(
+            runs(self.update_all_arguments(), "Update everything listed"))
         self.update_rows.group.set_description(
             "" if self.packages else "No app has a newer version.")
         for channel in self.channels:
@@ -464,7 +644,10 @@ class Window(Adw.ApplicationWindow):
                 channel["name"],
                 f"{short(channel['pinned'])} → {short(channel['latest'])}",
                 [self.button("Update",
-                             lambda c=channel: self.update_channel(c))])
+                             lambda c=channel: self.update_channel(c),
+                             tooltip=runs(["bump", channel["name"],
+                                           "--home"],
+                                          "Everything from this source"))])
         self.source_rows.group.set_visible(bool(self.channels))
         self.updates.set_visible_child_name("list")
         self.refresh_sensitivity()
@@ -486,7 +669,8 @@ class Window(Adw.ApplicationWindow):
         self.search_status.set_description("")
         self.results.set_visible_child_name("status")
         self.query(["--search"] + words,
-                   lambda lines: self.search_done(serial, words, lines))
+                   lambda lines: self.search_done(serial, words, lines),
+                   "Searching")
 
     def search_done(self, serial, words, lines):
         if serial != self.search_serial:
@@ -514,7 +698,10 @@ class Window(Adw.ApplicationWindow):
             else:
                 widgets = [self.button("Install",
                                        lambda n=name: self.install(n),
-                                       "suggested-action")]
+                                       "suggested-action",
+                                       runs(["bump", "--install", name],
+                                            "Add it to your config file "
+                                            "and install it"))]
             self.result_rows.add(f"{name}  {version}", synopsis, widgets)
         self.result_rows.group.set_description(
             "The first 100 matches; add a word to narrow it down."
@@ -530,7 +717,8 @@ class Window(Adw.ApplicationWindow):
     # -- Installed -------------------------------------------------------
 
     def load_installed(self):
-        self.query(["--installed"], self.installed_done)
+        self.query(["--installed"], self.installed_done,
+                   "Reading your apps")
         self.query(["--settings"], self.settings_done)
 
     def settings_done(self, lines):
@@ -538,6 +726,12 @@ class Window(Adw.ApplicationWindow):
         missing = False
         for line in lines or []:
             fields = line.split("\t")
+            if fields[0] == "setting" and len(fields) == 4 \
+                    and fields[1] == "config":
+                self.config_path = fields[3].split(" (", 1)[0]
+                self.folder_button.set_tooltip_text(
+                    "Open the folder of your config file\n"
+                    + self.config_path)
             if fields[0] == "setting" and len(fields) == 4 \
                     and fields[1] == "packages":
                 missing = fields[3].startswith("no (define")
@@ -580,7 +774,10 @@ class Window(Adw.ApplicationWindow):
                 widgets.append(self.version_chooser(package))
             widgets.append(self.button("Remove",
                                        lambda n=name: self.remove(n),
-                                       "destructive-action"))
+                                       "destructive-action",
+                                       runs(["bump", "--remove", name],
+                                            "Take it out of your config "
+                                            "file and uninstall it")))
             pinned = "@" in package["spec"]
             self.mine_rows.add(
                 name,
@@ -596,7 +793,10 @@ class Window(Adw.ApplicationWindow):
         newest = "newest"
         choices = [newest] + package["versions"]
         chooser = Gtk.DropDown.new_from_strings(choices)
-        chooser.set_tooltip_text("Which version to keep")
+        chooser.set_tooltip_text(
+            "Which version to keep\n\nChoosing one runs: guix bump "
+            f"--install {package['name']}@VERSION (newest: guix bump "
+            f"--install {package['name']})")
         if "@" in package["spec"]:
             current = package["spec"].split("@", 1)[1]
             if current in choices:
@@ -618,7 +818,8 @@ class Window(Adw.ApplicationWindow):
         self.confirm(
             f"Remove {name}?",
             "It is taken out of your config file and uninstalled.  Its own "
-            "settings and files in your home folder stay.",
+            "settings and files in your home folder stay."
+            f"\n\nRuns: guix bump --remove {name}",
             "Remove",
             lambda: self.run(["bump", "--remove", name],
                              f"Removing {name}: taking it out of your "
@@ -626,31 +827,6 @@ class Window(Adw.ApplicationWindow):
             destructive=True)
 
     # -- running commands in the terminal --------------------------------
-
-    def start_work(self, what):
-        self.work_started = time.monotonic()
-        self.work_what = what
-        self.work_step.set_text(what)
-        self.work_line.set_text("Starting")
-        self.work_time.set_text("0:00")
-        self.work_spinner.start()
-        self.work.set_reveal_child(True)
-        self.set_title(f"Guix Manager: {what}")
-
-        def tick():
-            seconds = int(time.monotonic() - self.work_started)
-            self.work_time.set_text(f"{seconds // 60}:{seconds % 60:02d}")
-            self.work_bar.pulse()
-            return True
-        self.work_timer = GLib.timeout_add(250, tick)
-
-    def stop_work(self):
-        if self.work_timer:
-            GLib.source_remove(self.work_timer)
-            self.work_timer = None
-        self.work_spinner.stop()
-        self.work.set_reveal_child(False)
-        self.set_title("Guix Manager")
 
     def on_output(self, terminal):
         """Show the current step (`==> ...' lines of guix bump) and the
@@ -681,23 +857,49 @@ class Window(Adw.ApplicationWindow):
         if self.busy:
             self.toast("Something is still running; wait for it to finish")
             return
+        self.begin()
+        self.work_what = hint.split(":")[0].rstrip(".")
+        self.work_step.set_text(self.work_what)
+        self.work_line.set_text(command_text(arguments))
         self.set_busy(True)
-        self.start_work(hint.split(":")[0].rstrip("."))
         self.hint.set_text(hint + "  If it asks something, click in the "
                            "terminal below and type the answer.")
-        self.revealer.set_reveal_child(True)
-        self.say("$ guix " + " ".join(arguments))
+        self.show_terminal()
+        self.say("$ " + command_text(arguments))
+
+        def spawned(_terminal, pid, error, *_):
+            self.child_pid = pid if pid and pid > 0 else None
         self.terminal.spawn_async(
             Vte.PtyFlags.DEFAULT, os.path.expanduser("~"),
             [guix()] + arguments, None, GLib.SpawnFlags.DEFAULT,
-            None, None, -1, None, None)
+            None, None, -1, None, spawned)
         self.terminal.grab_focus()
 
     def on_child_exited(self, _terminal, status):
         ok = os.waitstatus_to_exitcode(status) == 0
-        self.set_busy(False)
-        self.stop_work()
-        if ok:
+        cancelled = self.cancelling
+        self.child_pid = None
+        self.busy = False
+        if not self.queries:
+            self.cancelling = False
+        seconds = int(time.monotonic() - self.work_started)
+        took = f"{seconds // 60}:{seconds % 60:02d}"
+        if cancelled and not ok:
+            self.finish(f"{self.work_what}: cancelled after {took}",
+                        "process-stop-symbolic", 0)
+        elif ok:
+            self.finish(f"{self.work_what}: done in {took}",
+                        "emblem-ok-symbolic", 1)
+        else:
+            self.finish(f"{self.work_what}: failed after {took}",
+                        "dialog-warning-symbolic", 0)
+        self.refresh_sensitivity()
+        if cancelled and not ok:
+            self.toast("Cancelled")
+            self.hint.set_text("Cancelled.  Nothing was switched; the "
+                               "config file is as it was.")
+            self.fill_installed()
+        elif ok:
             self.toast("Done")
             self.hint.set_text("Done.  Apps that were open keep their old "
                                "version until you close and reopen them.")
@@ -713,110 +915,128 @@ class Window(Adw.ApplicationWindow):
     # -- settings --------------------------------------------------------
 
     def show_settings(self):
-        """Which file and which lists in it `guix bump' works on."""
+        """Which file and which lists in it `guix bump' works on, and what
+        it does with git.  Each setting is its own group: the field, then
+        what it comes to now."""
         dialog = Adw.PreferencesDialog(title="Settings")
         page = Adw.PreferencesPage()
-        group = Adw.PreferencesGroup(
-            title="Your config file",
-            description="Guix Manager changes one file: your Guix config.  "
-                        "Say where it is and what its lists are called.  "
-                        "Leave a field empty for the usual name.")
-        page.add(group)
-        fields = (
-            ("config", "Config file",
-             "usually ~/config.scm"),
-            ("packages", "Name of the package list",
-             "a list of names that Install and Remove edit; usually "
-             "%managed-packages"),
-            ("channels", "Name of the channel list",
-             "the list of channels to update; empty means every channel in "
-             "the file"))
-        rows = {}
-        for key, title, note in fields:
+        rows = {}                       # key: (entry or combo, effect, note)
+        state = {"updating": False}
+
+        def section(title, description):
+            label = Adw.PreferencesGroup(title=title, description=description)
+            page.add(label)
+
+        def entry_setting(key, title, note, browse=False):
+            group = Adw.PreferencesGroup()
             entry = Adw.EntryRow(title=title, show_apply_button=True)
-            effect = Adw.ActionRow(title="", subtitle=note)
+            effect = Adw.ActionRow(title=escape(note), subtitle="")
             effect.add_css_class("property")
             entry.connect("apply",
-                          lambda e, k=key: change(k, e.get_text().strip()))
+                          lambda e: change(key, e.get_text().strip()))
+            entry.set_tooltip_text(
+                f"Pressing ✓ runs: guix bump --set {key}=VALUE "
+                "(empty: the default)")
+            if browse:
+                button = Gtk.Button(icon_name="document-open-symbolic",
+                                    valign=Gtk.Align.CENTER,
+                                    tooltip_text="Choose the file")
+                button.add_css_class("flat")
+
+                def chosen(chooser, result):
+                    try:
+                        file = chooser.open_finish(result)
+                    except GLib.Error:
+                        return
+                    entry.set_text(file.get_path())
+                    change(key, file.get_path())
+                button.connect(
+                    "clicked",
+                    lambda *_: Gtk.FileDialog(
+                        title="Your Guix config file").open(self, None,
+                                                            chosen))
+                entry.add_suffix(button)
             group.add(entry)
             group.add(effect)
+            page.add(group)
             rows[key] = (entry, effect, note)
 
-        browse = Gtk.Button(icon_name="document-open-symbolic",
-                            valign=Gtk.Align.CENTER,
-                            tooltip_text="Choose the file")
-        browse.add_css_class("flat")
+        section("Your config file",
+                "Guix Manager changes one file: your Guix config.  Say where "
+                "it is and what its lists are called.  Leave a field empty "
+                "for the usual name.")
+        entry_setting("config", "Config file", "Usually ~/config.scm",
+                      browse=True)
+        entry_setting("packages", "Name of the package list",
+                      "The list Install and Remove edit; usually "
+                      "%managed-packages")
+        entry_setting("channels", "Name of the channel list",
+                      "The channels to update; empty means every channel in "
+                      "the file")
 
-        def chosen(chooser, result):
-            try:
-                file = chooser.open_finish(result)
-            except GLib.Error:
-                return
-            rows["config"][0].set_text(file.get_path())
-            change("config", file.get_path())
-        browse.connect(
-            "clicked",
-            lambda *_: Gtk.FileDialog(title="Your Guix config file").open(
-                self, None, chosen))
-        rows["config"][0].add_suffix(browse)
-
-        def show(lines):
-            for line in lines or []:
-                fields = line.split("\t")
-                if fields[0] == "setting" and len(fields) == 4 \
-                        and fields[1] in rows:
-                    entry, effect, note = rows[fields[1]]
-                    if entry.get_text() != fields[2]:
-                        entry.set_text(fields[2])
-                    effect.set_title(escape(note))
-                    effect.set_subtitle(escape("In use: " + fields[3]))
-
-        def change(key, value):
-            def changed(lines):
-                show(lines)
-                self.refresh()
-            self.query(["--set", f"{key}={value}"], changed)
-
-        # What to do with a config kept in git.
-        git_group = Adw.PreferencesGroup(
-            title="Keeping the config file in git",
-            description="When the config file is in a git repository, each "
-                        "change Guix Manager makes can be committed, and "
-                        "pushed to the repository's remote (for example "
-                        "GitHub), so its history is the machine's history.")
+        section("Keeping the config file in git",
+                "When the config file is in a git repository, each change "
+                "can be committed there, and pushed to a remote (GitHub, "
+                "say), so its history is the machine's history.")
         modes = ["push", "commit", "off"]
-        labels = ["Commit and push each change", "Commit only",
-                  "Don't use git"]
-        git_row = Adw.ComboRow(title="Changes",
-                               model=Gtk.StringList.new(labels))
-        git_effect = Adw.ActionRow(title="")
+        git_group = Adw.PreferencesGroup()
+        git_row = Adw.ComboRow(
+            title="Each change",
+            model=Gtk.StringList.new(["Commit and push", "Commit only",
+                                      "Don't use git"]),
+            tooltip_text="Choosing runs: guix bump --set "
+                         "git=push|commit|off")
+        git_effect = Adw.ActionRow(title="What happens", subtitle="")
         git_effect.add_css_class("property")
         git_group.add(git_row)
         git_group.add(git_effect)
         page.add(git_group)
-        updating = {"now": False}
+        rows["git"] = (git_row, git_effect, "What happens")
 
         def git_chosen(row, _param):
-            if not updating["now"]:
+            if not state["updating"]:
                 change("git", modes[row.get_selected()])
         git_row.connect("notify::selected", git_chosen)
 
-        def show_git(lines):
+        entry_setting("git-remote", "Remote to push to",
+                      "The repository's `origin', for example "
+                      "https://github.com/you/my-guix.git; empty removes it")
+        entry_setting("git-name", "Commit author name",
+                      "This repository's user.name; empty uses your global "
+                      "git setting")
+        entry_setting("git-email", "Commit author email",
+                      "This repository's user.email (a GitHub no-reply "
+                      "address keeps yours private); empty uses your global "
+                      "git setting")
+
+        def show(lines):
+            state["updating"] = True
             for line in lines or []:
                 fields = line.split("\t")
-                if fields[0] == "setting" and len(fields) == 4 \
-                        and fields[1] == "git":
-                    updating["now"] = True
-                    git_row.set_selected(modes.index(fields[2])
-                                         if fields[2] in modes else 0)
-                    updating["now"] = False
-                    git_effect.set_subtitle(escape("Now: " + fields[3]))
+                if fields[0] != "setting" or len(fields) != 4 \
+                        or fields[1] not in rows:
+                    continue
+                widget, effect, note = rows[fields[1]]
+                if fields[1] == "git":
+                    widget.set_selected(modes.index(fields[2])
+                                        if fields[2] in modes else 0)
+                elif widget.get_text() != fields[2]:
+                    widget.set_text(fields[2])
+                effect.set_subtitle(escape("In use: " + fields[3]))
+            state["updating"] = False
 
-        shown = show
-
-        def show(lines):              # noqa: F811 (both parts)
-            shown(lines)
-            show_git(lines)
+        def change(key, value):
+            def changed(lines):
+                if lines is None:
+                    self.toast("That setting was not changed; see the "
+                               "terminal")
+                    self.show_terminal()
+                    self.query(["--settings"], show)
+                    return
+                show(lines)
+                self.refresh()
+            self.query(["--set", f"{key}={value}"], changed,
+                       "Saving settings")
 
         dialog.add(page)
         self.query(["--settings"], show)
@@ -835,37 +1055,48 @@ class Window(Adw.ApplicationWindow):
                        lambda _d, response: response == "go" and callback())
         dialog.present(self)
 
+    @staticmethod
+    def update_app_arguments(package):
+        if package["channel"] == "guix" and not package["pulled"]:
+            return ["bump", package["name"], "--yes"]
+        return ["bump", package["name"]]
+
     def update_app(self, package):
         name = package["name"]
-        if package["channel"] == "guix" and not package["pulled"]:
+        arguments = self.update_app_arguments(package)
+        if "--yes" in arguments:
             # `guix bump' would ask this in the terminal; ask it here.
             self.confirm(
                 "Update everything from Guix?",
                 f"{name} comes from Guix itself.  Updating it updates every "
                 "package Guix provides, which can mean a lot to download or "
-                "compile.",
+                "compile.\n\nRuns: " + command_text(arguments),
                 "Update everything",
-                lambda: self.run(["bump", name, "--yes"],
+                lambda: self.run(arguments,
                                  f"Updating {name} and the rest of Guix."))
         else:
-            self.run(["bump", name], f"Updating {name}.")
+            self.run(arguments, f"Updating {name}.")
 
     def update_channel(self, channel):
         self.run(["bump", channel["name"], "--home"],
                  f"Updating everything from {channel['name']}.")
 
-    def update_all(self):
+    def update_all_arguments(self):
         flags = ["--home"]
         if any(package["where"] == "system" for package in self.packages):
             flags = ["--system", "--home"]
-        self.run(["bump", "all"] + flags, "Updating everything.")
+        return ["bump", "all"] + flags
+
+    def update_all(self):
+        self.run(self.update_all_arguments(), "Updating everything.")
 
     def nightly(self):
         self.confirm(
             "Update everything, then power off?",
             "Updates every source, applies the system and your apps, cleans "
             "up old versions and turns the computer off when it has "
-            "finished.  It asks for your password once, now.",
+            "finished.  It asks for your password once, now."
+            "\n\nRuns: guix nightly",
             "Update and power off",
             lambda: self.run(["nightly"],
                              "Updating everything; the computer powers off "
@@ -875,7 +1106,8 @@ class Window(Adw.ApplicationWindow):
         self.confirm(
             "Undo the last update?",
             "Puts every source back to what it was before the last update "
-            "and applies that to your apps.",
+            "and applies that to your apps."
+            "\n\nRuns: guix bump --undo --home",
             "Undo",
             lambda: self.run(["bump", "--undo", "--home"],
                              "Going back to before the last update."))
