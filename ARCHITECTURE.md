@@ -18,7 +18,15 @@ extensions/guix/extensions/nightly.scm               `guix nightly': one call
     |  edits                |  runs
     v                       v
 the user's config.scm       guix pull / home / system / time-machine / repl
+                            screen-off/screen-off (C, for --screen-off)
 ```
+
+`screen-off` is the one piece that is not Scheme: Guile has no Wayland
+client.  `guix bump --screen-off` forks it with its own PID; it switches the
+screens off with wlr-output-power-management, on at the next input
+(ext-idle-notify version 2, which ignores idle inhibitors, so a video left
+playing doesn't keep them lit), off again after a minute without input, and
+quits once that PID is gone and the screens are on.
 
 `bump.scm` and `nightly.scm` are Guix extensions: any directory on
 `GUIX_EXTENSIONS_PATH` that has `guix/extensions/NAME.scm` adds the command

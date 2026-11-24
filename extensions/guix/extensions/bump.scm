@@ -33,11 +33,12 @@
   #:use-module (srfi srfi-1)
   #:export (guix-bump))
 
-(define %version "2.4")
+(define %version "2.5")
 
 ;; Replaced with a store file name when the package is built.
 (define %git "@GIT@")
 (define %bash "@BASH@")
+(define %screen-off "@SCREEN_OFF@")
 
 (define (git)
   (if (string-prefix? "/" %git) %git "git"))
@@ -473,6 +474,49 @@ See `guix bump --help'.~%")
               (loop)))
           (primitive-exit 0))
         pid)))
+
+(define (screen-off-program)
+  ;; The helper that keeps the screens off (screen-off/ in the source): the
+  ;; packaged one, else one built with `make' in this checkout, else #f.
+  (if (string-prefix? "/" %screen-off)
+      %screen-off
+      ;; A checkout's extensions directory is on GUIX_EXTENSIONS_PATH (or
+      ;; on the load path, with -L); the helper is beside it.
+      (any (lambda (dir)
+             (let ((built (string-append dir "/../screen-off/screen-off")))
+               (and (file-exists?
+                     (string-append dir "/guix/extensions/bump.scm"))
+                    (file-exists? built)
+                    (canonicalize-path built))))
+           (append (string-split (or (getenv "GUIX_EXTENSIONS_PATH") "")
+                                 #\:)
+                   %load-path))))
+
+(define (start-screen-off)
+  ;; Turn the screens off a second after the last input, on at the next
+  ;; input, off again after a minute without input, for as long as this
+  ;; process runs; see screen-off/screen-off.c.  Only in a Wayland session.
+  (let ((program (screen-off-program)))
+    (cond ((not (getenv "WAYLAND_DISPLAY"))
+           (emit "Not in a Wayland session: the screens stay on.~%"))
+          ((not program)
+           (emit "The screen-off helper is missing (build it with `make -C screen-off'): the screens stay on.~%"))
+          (else
+           (let ((parent (getpid))
+                 (pid (primitive-fork)))
+             (when (zero? pid)
+               (catch #t
+                 (lambda ()
+                   ;; Not the terminal or a pipe: with `guix nightly | tee',
+                   ;; tee would wait for the helper, which outlives us.
+                   (let ((null (open-fdes "/dev/null" O_RDWR)))
+                     (dup2 null 0)
+                     (dup2 null 1)
+                     (dup2 null 2))
+                   (execl program program (number->string parent)))
+                 (lambda _ #t))
+               (primitive-exit 1))
+             (emit "The screens turn off now; move the mouse to see how it is going.~%"))))))
 
 (define (power-off)
   (say "Powering off in 60 seconds.  Ctrl-C to cancel.")
@@ -1469,6 +1513,11 @@ show each channel's pinned, running and latest commit.
                    collect garbage if less than 100G is free
       --log        also write everything to a file in ~/.local/state/guix-bump
       --shutdown   power the computer off once everything succeeded
+      --screen-off turn the screens off while it runs: they come on at the
+                   next input and go off after a minute without any (also
+                   when a video or an app keeps the session awake).  If it
+                   fails they stay off until the next input, with the error
+                   on screen.  Wayland only
   -n, --dry-run    show which pins would move and stop
   -h, --help       show this help
 
@@ -1498,7 +1547,8 @@ still open in their old version are listed, and a reboot is suggested when
 the kernel or a driver changed.
 
 `guix nightly' is short for:
-  guix bump all --system --home --yes --gc --log --shutdown
+  guix bump all --system --home --yes --gc --log --shutdown --screen-off
+(--screen-on leaves out --screen-off).
 "))
 
 (define-command (guix-bump . args)
@@ -1532,6 +1582,7 @@ the kernel or a driver changed.
   (define set?       (flag? "--set"))
   (define manage?    (or install? remove? search? installed? settings? set?))
   (define shutdown? (flag? "--shutdown"))
+  (define screen-off? (flag? "--screen-off"))
   (define dry-run?  (flag? "-n" "--dry-run"))
   (define undo?     (flag? "--undo"))
   (define yes?      (flag? "-y" "--yes"))
@@ -1542,6 +1593,7 @@ the kernel or a driver changed.
 
   (for-each (lambda (arg)
               (unless (member arg '("-H" "--home" "-S" "--system" "--shutdown"
+                                    "--screen-off"
                                     "-n" "--dry-run" "--undo" "-y" "--yes"
                                     "--gc" "--log" "--check" "--porcelain"
                                     "--install" "--remove" "--search"
@@ -1698,6 +1750,10 @@ the kernel or a driver changed.
       ;; Ask for the password before the long part.
       (define keepalive
         (and system? (not dry-run?) (start-sudo-keepalive)))
+
+      ;; After the password prompt, which needs the screen.
+      (when (and screen-off? (not dry-run?))
+        (start-screen-off))
 
       (define (finish code)
         (when keepalive

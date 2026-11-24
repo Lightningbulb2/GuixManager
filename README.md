@@ -44,7 +44,7 @@ GUIX_EXTENSIONS_PATH=$PWD/extensions guix bump --help
 | `guix bump --installed` | list what your home has installed |
 | `guix bump --undo` | put the pins back as they were before the last change |
 | `guix bump --settings` / `--set KEY=VALUE` | which file and lists are used |
-| `guix nightly` | update everything, apply system and home, clean up, power off |
+| `guix nightly` | update everything, apply system and home, clean up, power off; the screens stay off meanwhile (`--screen-on` keeps them on) |
 
 `guix bump --help` has every option.
 

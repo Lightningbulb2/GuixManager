@@ -9,6 +9,8 @@ fit and why. Read that first.
 - `extensions/guix/extensions/bump.scm`: `guix bump`. All logic lives here.
 - `extensions/guix/extensions/nightly.scm`: `guix nightly`, one call into
   `bump.scm`.
+- `screen-off/`: the C helper behind `--screen-off` (`make -C screen-off`;
+  needs wayland, wayland-protocols, wlr-protocols).
 - `guix-manager`: the window (one Python file, no extension, executable).
 - `data/`: the desktop entry.
 - `tests/`: `run.sh` and the Scheme tests of the text edits and settings.
@@ -70,9 +72,15 @@ Pitfalls met so far:
 - `guix repl FILE` runs a script with Guix's modules; `(load* FILE
   '((guix profiles) (gnu)))` evaluates a config as `guix home` does, and the
   config can branch on `(command-line)`, which the script sets.
-- The placeholders `@GIT@` and `@BASH@` in `bump.scm` are replaced by store
-  file names when packaged; unreplaced, it falls back to `git` and `sh` from
-  `PATH`.
+- The placeholders `@GIT@`, `@BASH@` and `@SCREEN_OFF@` in `bump.scm` are
+  replaced by store file names when packaged; unreplaced, it falls back to
+  `git` and `sh` from `PATH`, and to `screen-off/screen-off` beside the
+  extensions directory it was loaded from (build it with `make`).
+- `screen-off` must ignore idle inhibitors (ext-idle-notify version 2's
+  input idle notifications): an app or video that keeps the session awake
+  would otherwise keep the screens on all night.  To try it without
+  `guix nightly`: `screen-off PID` blanks until PID exits and a key is
+  pressed; SIGTERM turns the screens back on.
 
 ## Packaging
 

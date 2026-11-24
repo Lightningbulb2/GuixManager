@@ -1,2 +1,6 @@
 __pycache__/
 *.go
+screen-off/screen-off
+screen-off/*-protocol.h
+screen-off/ext-idle-notify-v1.c
+screen-off/wlr-output-power-management-unstable-v1.c

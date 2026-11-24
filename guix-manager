@@ -24,7 +24,7 @@ gi.require_version("Vte", "3.91")
 from gi.repository import Adw, Gio, GLib, Gtk, Pango, Vte  # noqa: E402
 
 APP_ID = "io.github.lightningbulb2.GuixManager"
-VERSION = "2.4"
+VERSION = "2.5"
 
 
 def guix():
@@ -1095,7 +1095,8 @@ class Window(Adw.ApplicationWindow):
             "Update everything, then power off?",
             "Updates every source, applies the system and your apps, cleans "
             "up old versions and turns the computer off when it has "
-            "finished.  It asks for your password once, now."
+            "finished.  It asks for your password once, now.  The screens "
+            "turn off while it works: move the mouse to look."
             "\n\nRuns: guix nightly",
             "Update and power off",
             lambda: self.run(["nightly"],
