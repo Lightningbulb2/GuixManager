@@ -11,6 +11,7 @@ itself: all the logic is in `guix bump'.
 """
 
 import os
+import re
 import shutil
 import signal
 import sys
@@ -24,7 +25,7 @@ gi.require_version("Vte", "3.91")
 from gi.repository import Adw, Gio, GLib, Gtk, Pango, Vte  # noqa: E402
 
 APP_ID = "io.github.lightningbulb2.GuixManager"
-VERSION = "2.5"
+VERSION = "2.6"
 
 
 def guix():
@@ -219,6 +220,7 @@ class Window(Adw.ApplicationWindow):
         box.append(self.work_line)
         box.append(self.work_bar)
         self.work_started = 0
+        self.build_fraction = None      # from guix bump's "[ 41%] ..." line
         GLib.timeout_add(250, self.tick)
         return box
 
@@ -227,7 +229,8 @@ class Window(Adw.ApplicationWindow):
         if self.busy or self.queries:
             seconds = int(time.monotonic() - self.work_started)
             self.work_time.set_text(f"{seconds // 60}:{seconds % 60:02d}")
-            self.work_bar.pulse()
+            if self.build_fraction is None:
+                self.work_bar.pulse()
         return True
 
     def show_state(self):
@@ -252,6 +255,7 @@ class Window(Adw.ApplicationWindow):
         if not (self.busy or self.queries):
             self.work_started = time.monotonic()
             self.work_time.set_text("0:00")
+            self.build_fraction = None
             self.work_bar.set_fraction(0)
 
     def finish(self, outcome, icon, fraction):
@@ -844,6 +848,14 @@ class Window(Adw.ApplicationWindow):
         if not lines:
             return
         self.work_line.set_text(lines[-1])
+        # While guix bump builds, its last line is "[ 41%] 3/14 built ...":
+        # the bar shows that share instead of pulsing.
+        progress = re.match(r"\[\s*(\d+)%\]", lines[-1])
+        if progress:
+            self.build_fraction = min(int(progress.group(1)), 100) / 100
+            self.work_bar.set_fraction(self.build_fraction)
+        elif lines[-1].startswith(("==> ", "$ ")):
+            self.build_fraction = None
         for line in reversed(lines):
             if line.startswith("$ guix "):
                 break                   # this command's first line

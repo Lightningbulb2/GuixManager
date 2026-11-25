@@ -33,7 +33,7 @@
   #:use-module (srfi srfi-1)
   #:export (guix-bump))
 
-(define %version "2.5")
+(define %version "2.6")
 
 ;; Replaced with a store file name when the package is built.
 (define %git "@GIT@")
@@ -425,10 +425,11 @@ See `guix bump --help'.~%")
 ;;; Running things.
 ;;;
 
-(define (run . command)
+(define (run-status . command)
   ;; Run COMMAND, showing it; with a log, its output goes there as well.
+  ;; Return its exit status, or #f if a signal ended it.
   (emit "~%$ ~a~%" (string-join command " "))
-  (zero?
+  (status:exit-val
    (if %log
        (begin
          (setenv "GUIX_BUMP_LOG" %log)
@@ -436,6 +437,10 @@ See `guix bump --help'.~%")
                 "set -o pipefail; \"$@\" 2>&1 | tee -a \"$GUIX_BUMP_LOG\""
                 "sh" command))
        (apply system* command))))
+
+(define (run . command)
+  ;; Run COMMAND as `run-status' does; return true on success.
+  (eqv? 0 (apply run-status command)))
 
 (define (quietly . command)
   ;; Run COMMAND with its output discarded; return true on success.
@@ -614,6 +619,445 @@ The build farms usually catch up within a day or two.~%")
     (and (string? answer)
          (member (string-downcase (string-trim-both answer)) '("y" "yes"))
          #t)))
+
+
+;;;
+;;; Building before applying, with one progress line for all builds.
+;;;
+;;; `guix system reconfigure' draws a progress bar only while exactly one
+;;; build runs, and a spinner otherwise, though it tracks every build's
+;;; progress.  So before a reconfigure, `guix bump' builds the same thing
+;;; itself with this script, run by the pulled Guix (the modules of the Guix
+;;; running `guix bump' are older after a pull, so it can't be done here),
+;;; and shows:
+;;;
+;;;   [ 41%] 3/14 built · craft-suite 44% · cosmic-suite build 12m
+;;;
+;;; The percentage weighs each build by how long it took last time
+;;; (build-times.scm in the state directory, first filled from the daemon's
+;;; build logs), so a minute-long build doesn't count as much as an hour-long
+;;; one.  The reconfigure then finds everything built.
+;;;
+;;; Arguments: KIND (system or home), the config file, the file of build
+;;; times, then build options.  Exit status: 0 built, 1 a build (or the
+;;; config) failed, 3 the script itself failed, in which case the
+;;; reconfigure does the building as usual.
+
+(define %build-script
+  '(begin
+     (use-modules (guix store) (guix monads) (guix derivations) (guix ui)
+                  (guix status) (guix scripts) (guix scripts build)
+                  ((guix build syscalls) #:select (terminal-columns))
+                  (gnu system) (gnu home)
+                  (srfi srfi-1) (srfi srfi-11) (srfi srfi-34)
+                  (ice-9 match) (ice-9 format) (ice-9 popen) (ice-9 rdelim)
+                  (ice-9 regex))
+
+     (define (now) (/ (get-internal-real-time)
+                      (exact->inexact internal-time-units-per-second)))
+
+     (define (base-name file)
+       ;; "craft-suite" for /gnu/store/HASH-craft-suite-0.drv (or a log
+       ;; file HASH-craft-suite-0.drv.gz).
+       (let* ((file (basename file))
+              (file (substring file (+ 1 (or (string-index file #\-) -1))))
+              (file (fold (lambda (suffix file)
+                            (if (string-suffix? suffix file)
+                                (string-drop-right file (string-length suffix))
+                                file))
+                          file '(".gz" ".bz2" ".zst" ".drv"))))
+         ;; The version starts at the first hyphen followed by a digit
+         ;; (`package-name->name+version' only splits NAME@VERSION).
+         (match (string-match "-[0-9]" file)
+           (#f file)
+           (m (substring file 0 (match:start m))))))
+
+     (define (clock seconds)
+       (let* ((s (inexact->exact (round seconds)))
+              (h (quotient s 3600))
+              (m (quotient (remainder s 3600) 60)))
+         (if (> h 0)
+             (format #f "~d:~2,'0d:~2,'0d" h m (remainder s 60))
+             (format #f "~d:~2,'0d" m (remainder s 60)))))
+
+     (define (logged-times)
+       ;; NAME -> seconds of its latest build, from the daemon's logs: a log
+       ;; is created when its build starts and last written when it ends.
+       ;; A graft has the name of what it grafts and a log of a few hundred
+       ;; bytes, so a log over 2 KB beats any smaller one.
+       (let ((table (make-hash-table))
+             (best (make-hash-table))           ;NAME -> (big? . written)
+             ;; stat, not find's %B: that one printed -1 here.
+             (pipe (open-pipe* OPEN_READ "sh" "-c"
+                               "find /var/log/guix/drvs -type f -print0 \
+| xargs -0 -r stat -c '%W %Y %s %n' 2>/dev/null")))
+         (define (better? a b)
+           (or (and (car a) (not (car b)))
+               (and (eq? (car a) (car b)) (> (cdr a) (cdr b)))))
+         (let loop ()
+           (match (read-line pipe)
+             ((? eof-object?) #t)
+             (line
+              (match (string-split line #\space)
+                ((born written size file)
+                 (let* ((born (string->number born))
+                        (written (string->number written))
+                        (size (string->number size))
+                        (name (base-name file))
+                        (key (and size written
+                                  (cons (> size 2000) written))))
+                   (when (and born key (> born 0)
+                              (<= 0 (- written born) 43200)
+                              (better? key (hash-ref best name '(#f . 0))))
+                     (hash-set! best name key)
+                     (hash-set! table name
+                                (inexact->exact
+                                 (round (- written born)))))))
+                (_ #t))
+              (loop))))
+         (close-pipe pipe)
+         table))
+
+     (define (read-times file)
+       (if (file-exists? file)
+           (let ((table (make-hash-table)))
+             (for-each (match-lambda
+                         ((name . seconds) (hash-set! table name seconds))
+                         (_ #t))
+                       (or (false-if-exception
+                            (call-with-input-file file read))
+                           '()))
+             table)
+           (logged-times)))
+
+     (define (write-times table file)
+       (let ((new (string-append file ".new")))
+         (call-with-output-file new
+           (lambda (port)
+             (write (sort (hash-map->list cons table)
+                          (lambda (a b) (string<? (car a) (car b))))
+                    port)
+             (newline port)))
+         (rename-file new file)))
+
+     (define (trivial? drv)
+       ;; Grafts, profiles and profile hooks: seconds each, and many.
+       ;; Downloads and checkouts (fixed-output), whose names start like
+       ;; the package's ("cosmic-term-92b3fb5-checkout").  And an app taken
+       ;; from a suite's output (hyperguix's `suite-member'), which has the
+       ;; name, and so the old build times, of the app.
+       (or (memq (assq-ref (derivation-properties drv) 'type)
+                 '(graft profile profile-hook))
+           (fixed-output-derivation? drv)
+           (and (not (string-suffix? "-suite-0.drv"
+                                     (derivation-file-name drv)))
+                (any (lambda (input)
+                       (string-suffix? "-suite-0.drv"
+                                       (derivation-input-path input)))
+                     (derivation-inputs drv)))))
+
+     (define (main kind config times-file args)
+       ;; --dry-run: only show what would be built and how long it took.
+       (define dry-run? (member "--dry-run" args))
+       (define build-args (delete "--dry-run" args))
+       (define opts
+         ;; The defaults of `guix build' (not exported there).
+         (parse-command-line build-args %standard-build-options
+                             (list '((graft? . #t)
+                                     (substitutes? . #t)
+                                     (offload? . #t)
+                                     (print-build-trace? . #t)
+                                     (print-extended-build-trace? . #t)
+                                     (multiplexed-build-output? . #t)
+                                     (debug . 0)))))
+       (define object
+         (begin
+           ;; The config may choose what it returns by the command line.
+           (set-program-arguments (list "guix" kind "reconfigure" config))
+           (load* config (if (string=? kind "home")
+                             '((gnu home))
+                             '((gnu system) (gnu services)
+                               (gnu system shadow))))))
+       (define port (current-error-port))
+       (define tty? (isatty? port))
+       (define times (read-times times-file))
+
+       (with-store store
+         (set-build-options-from-command-line store opts)
+         (let ((weights (make-hash-table))      ;.drv file -> seconds
+               (real-files (make-hash-table))   ;.drv files counted as builds
+               (trivial-files (make-hash-table))
+               (total 0)                        ;seconds of weight to do
+               (real-count 0)
+               (started (make-hash-table))      ;.drv file -> time
+               (done 0)                         ;seconds of weight done
+               (built 0)                        ;real builds done
+               (begun (now))
+               (last-drawn 0)
+               (last-logged 0)
+               (last-percent -1)
+               (drawn? #f))
+
+           (define (lower graft?)
+             (parameterize ((%graft? graft?))
+               (run-with-store store
+                 (if (operating-system? object)
+                     (operating-system-derivation object)
+                     (home-environment-derivation object)))))
+
+           (define (plan! inputs)
+             ;; Add what realizing INPUTS (derivation inputs) takes to the
+             ;; totals.  Return the derivations to build and the number of
+             ;; items to download.
+             (let-values (((builds downloads)
+                           (derivation-build-plan store inputs)))
+               (for-each
+                (lambda (d)
+                  (let ((file (derivation-file-name d)))
+                    (unless (hash-ref weights file #f)
+                      (let ((w (if (trivial? d)
+                                   1
+                                   (max 1 (hash-ref times (base-name file)
+                                                    60)))))
+                        (hash-set! weights file w)
+                        (set! total (+ total w))
+                        (when (trivial? d)
+                          (hash-set! trivial-files file #t))
+                        ;; What is counted and named as a build: what took
+                        ;; over 10 s last time (or is new), not the many
+                        ;; scripts and files a system is made of.
+                        (when (> w 10)
+                          (hash-set! real-files file #t)
+                          (set! real-count (+ real-count 1)))))))
+                builds)
+               (values builds (length downloads))))
+
+           (define (handler continue store* things mode)
+             ;; Builds asked for while the system is computed (grafts need
+             ;; the outputs they graft): count them too, then go on.
+             (plan! (filter-map
+                     (lambda (thing)
+                       (let ((file (if (pair? thing) (car thing) thing)))
+                         (and (derivation-path? file)
+                              (and=> (false-if-exception
+                                      (read-derivation-from-file file))
+                                     derivation-input))))
+                     things))
+             (continue #t))
+
+           (define (weight file) (hash-ref weights file 0))
+           (define (real? file) (hash-ref real-files file #f))
+           (define (since file) (- (now) (hash-ref started file (now))))
+
+           (define (running status)
+             ;; The real builds, oldest first.
+             (sort (filter (lambda (b) (real? (build-derivation b)))
+                           (build-status-building status))
+                   (lambda (a b)
+                     (< (hash-ref started (build-derivation a) 0)
+                        (hash-ref started (build-derivation b) 0)))))
+
+           (define (percent status)
+             (let ((running
+                    (fold + 0
+                          (map (lambda (b)
+                                 (let* ((file (build-derivation b))
+                                        (w (weight file))
+                                        (c (build-completion b)))
+                                   (* w (if c
+                                            (/ (min c 100) 100.)
+                                            (min 0.95
+                                                 (/ (since file) (max w 1)))))))
+                               (build-status-building status)))))
+               (min 99 (inexact->exact
+                        (floor (* 100 (/ (+ done running) (max total 1))))))))
+
+           (define (line status)
+             (define small
+               (- (length (build-status-building status))
+                  (length (running status))))
+             (string-join
+              (append
+               (list (format #f "[~3d%] ~a/~a built" (percent status)
+                             built real-count))
+               (map (lambda (b)
+                      (let ((file (build-derivation b)))
+                        (string-append
+                         (base-name file) " "
+                         (cond ((build-completion b)
+                                => (lambda (c)
+                                     (format #f "~d%" (inexact->exact
+                                                       (round c)))))
+                               ((build-phase b)
+                                => (lambda (phase)
+                                     (format #f "~a ~a" phase
+                                             (clock (since file)))))
+                               (else (clock (since file)))))))
+                    (running status))
+               (if (zero? small) '() (list (format #f "~a small" small)))
+               (match (length (build-status-downloading status))
+                 (0 '())
+                 (n (list (format #f "~a downloading" n)))))
+              " · "))
+
+           (define (erase)
+             (when (and tty? drawn?)
+               (display (string #\return (integer->char 27) #\[ #\K) port)
+               (set! drawn? #f)))
+
+           (define (draw status important?)
+             ;; On a terminal, redraw the line (at most 4 times a second
+             ;; unless IMPORTANT?); in a log, add a line when a real build
+             ;; starts or ends, or once a minute.
+             (let ((text (line status))
+                   (p (percent status)))
+               (cond (tty?
+                      (when (or important? (> (- (now) last-drawn) 0.25))
+                        (let ((width (max 20 (- (terminal-columns port) 1))))
+                          (erase)
+                          (display (if (> (string-length text) width)
+                                       (string-take text width)
+                                       text)
+                                   port)
+                          (force-output port)
+                          (set! drawn? #t)
+                          (set! last-drawn (now)))))
+                     ((or important?
+                          (and (not (= p last-percent))
+                               (> (- (now) last-logged) 60)))
+                      (display text port)
+                      (newline port)
+                      (force-output port)
+                      (set! last-logged (now))
+                      (set! last-percent p)))))
+
+           (define (say-line text)
+             (erase)
+             (display text port)
+             (newline port)
+             (force-output port))
+
+           (define (on-event event old status)
+             (match event
+               (('build-started file . _)
+                (hash-set! started file (now))
+                (draw status (real? file)))
+               (('build-succeeded file . _)
+                (let ((seconds (since file)))
+                  (set! done (+ done (weight file)))
+                  (unless (hash-ref trivial-files file #f)
+                    (hash-set! times (base-name file)
+                               (inexact->exact (round seconds))))
+                  (when (real? file)
+                    (set! built (+ built 1))
+                    (say-line (format #f "built ~a in ~a" (base-name file)
+                                      (clock seconds))))
+                  (draw status (real? file))))
+               (((or 'build-failed 'download-failed) . _)
+                (erase)
+                (print-build-event/quiet event old status port)
+                (draw status #t))
+               (('build-log #f text)
+                ;; Messages of the daemon itself, not of a build; the
+                ;; substitute queries redraw a line of their own.
+                (let ((text (string-trim-both
+                             (last (string-split text #\return)))))
+                  (unless (or (string-null? text)
+                              (string-prefix? "substitute:" text))
+                    (say-line text)))
+                (draw status #f))
+               (_ (draw status #f))))
+
+           (with-status-report on-event
+             (say-line "Computing what to build...")
+             ;; First everything that is compiled, without grafts: then it
+             ;; is all known up front, whereas with grafts most of it is
+             ;; built while the system is being computed.
+             (let*-values (((ungrafted) (lower #f))
+                           ((builds downloads)
+                            (plan! (list (derivation-input ungrafted)))))
+               (say-line (format #f "~a to build here (~a of earlier build \
+time), ~a to download." real-count (clock total) downloads))
+               (if dry-run?
+                   (begin
+                     (for-each (lambda (d)
+                                 (say-line (format #f "  ~8a ~a"
+                                         (clock (weight
+                                                 (derivation-file-name d)))
+                                         (base-name
+                                          (derivation-file-name d)))))
+                               (sort (delete-duplicates
+                                      (filter (lambda (d)
+                                                (real? (derivation-file-name d)))
+                                              builds)
+                                      (lambda (a b)
+                                        (string=? (derivation-file-name a)
+                                                  (derivation-file-name b))))
+                                     (lambda (a b)
+                                       (> (weight (derivation-file-name a))
+                                          (weight (derivation-file-name b))))))
+                     (say-line "(Then the grafts, not counted here.)")
+                     0)
+                   (guard (c ((store-protocol-error? c)
+                              (erase)
+                              (write-times times times-file)
+                              (format port "~a~%"
+                                      (store-protocol-error-message c))
+                              1))
+                     (with-build-handler handler
+                       (let ((compiled (remove trivial? builds)))
+                         (unless (null? compiled)
+                           (build-derivations store compiled)))
+                       ;; Then the system itself: what only grafting needs
+                       ;; (replacements such as the NVIDIA driver), and the
+                       ;; grafts.
+                       (let ((drv (lower (assoc-ref opts 'graft?))))
+                         (plan! (list (derivation-input drv)))
+                         (build-derivations store (list drv))))
+                     (erase)
+                     (write-times times times-file)
+                     (format port "Built everything in ~a.~%"
+                             (clock (- (now) begun)))
+                     0)))))))
+
+     (let ((status
+            (catch #t
+              (lambda ()
+                (match (drop-while (lambda (arg)
+                                     (not (member arg '("system" "home"))))
+                                   (cdr (command-line)))
+                  ((kind config times . build-args)
+                   (main kind config times build-args))))
+              (lambda (key . args)
+                (if (eq? key 'quit)
+                    (apply throw key args)
+                    (begin
+                      (format (current-error-port)
+                              "~%guix bump: the progress display failed (~a ~s); \
+the reconfigure builds instead.~%"
+                              key args)
+                      3))))))
+       (exit status))))
+
+(define (build-times-file)
+  (string-append (state-directory) "/build-times.scm"))
+
+(define (prebuild guix kind file build-options)
+  ;; Build what `guix KIND reconfigure FILE' needs, with one progress line
+  ;; for every build at once (see above).  Return #f if a build failed; if
+  ;; the script itself failed, return #t and let the reconfigure build.
+  (say "Building the ~a" (if (string=? kind "system")
+                             "system"
+                             "home environment"))
+  (let ((script (string-append (state-directory) "/build.scm")))
+    (call-with-output-file script
+      (lambda (port) (write %build-script port) (newline port)))
+    (let ((status (apply run-status guix "repl" "--" script kind file
+                         (build-times-file) build-options)))
+      (false-if-exception (delete-file script))
+      (case status
+        ((0 3) #t)
+        (else #f)))))
 
 
 ;;;
@@ -1161,8 +1605,10 @@ and, in the home environment's packages:
   ;; back; on success say what changed and commit with MESSAGE.
   (let ((before (installed-in (home-profile))))
     (write-config file updated)
-    (say "Applying to the home environment")
-    (cond ((apply run guix "home" "reconfigure" file build-options)
+    (cond ((and (prebuild guix "home" file build-options)
+                (begin
+                  (say "Applying to the home environment")
+                  (apply run guix "home" "reconfigure" file build-options)))
            (report-changes before (installed-in (home-profile)))
            (commit-config file message)
            (say "Done.")
@@ -1909,9 +2355,11 @@ can mean a lot to download or compile.~%"
 
       ;; 4. Apply.
       (when system?
-        (say "Reconfiguring the system")
-        (unless (apply run "sudo" guix "system" "reconfigure" file
-                       build-options)
+        (unless (and (prebuild guix "system" file build-options)
+                     (begin
+                       (say "Reconfiguring the system")
+                       (apply run "sudo" guix "system" "reconfigure" file
+                              build-options)))
           (emit "~%guix bump: system reconfigure failed; nothing was switched.
 `guix bump --undo~a' goes back to the pins from before.~%"
                 (if home? " --system --home" " --system"))
@@ -1920,8 +2368,11 @@ can mean a lot to download or compile.~%"
       (when (and home? (not home-alone?))
         (say "The home environment was applied with the system"))
       (when home-alone?
-        (say "Reconfiguring the home environment")
-        (unless (apply run guix "home" "reconfigure" file build-options)
+        (unless (and (prebuild guix "home" file build-options)
+                     (begin
+                       (say "Reconfiguring the home environment")
+                       (apply run guix "home" "reconfigure" file
+                              build-options)))
           (emit "~%guix bump: home reconfigure failed; nothing was switched.
 `guix bump --undo --home' goes back to the pins from before.~%")
           (finish 1)))

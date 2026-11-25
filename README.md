@@ -48,6 +48,25 @@ GUIX_EXTENSIONS_PATH=$PWD/extensions guix bump --help
 
 `guix bump --help` has every option.
 
+### Progress while building
+
+Before applying, `guix bump` builds what the reconfigure needs itself and
+shows one line for every build at once (Guix's own display shows a bar only
+while a single build runs):
+
+```
+[ 41%] 3/14 built · craft-suite 44% · cosmic-suite build 12m · 2 downloading
+```
+
+The percentage weighs each build by how long it took the last time, so an
+hour-long build counts for more than a one-minute one. Those times are kept
+in `~/.local/state/guix-bump/build-times.scm`, first filled from the build
+logs in `/var/log/guix/drvs`. A build's own percentage shows when it prints
+one (CMake, Ninja, and the Rust packages of the hyperguix channel); for the
+others the elapsed time is shown. In a log file (`--log`, `guix nightly`)
+the line is written when a build starts or ends, and at most once a minute
+otherwise. The reconfigure then finds everything built.
+
 ## What it expects in the config
 
 - **Channels** written as `(channel ... (commit "..."))` forms. `guix bump`
@@ -108,7 +127,8 @@ They are kept in `~/.config/guix-manager/settings`. The environment variable
   button to see the command it runs.
 - The strip under the buttons always shows what is running (or what
   happened last), its current step and latest line, the time so far and a
-  bar. **Cancel** stops it as Ctrl-C would; a command stopped halfway
+  bar, which shows how far the build is while `guix bump` builds.
+  **Cancel** stops it as Ctrl-C would; a command stopped halfway
   switches nothing and puts the config file back.
 - Drag the line above the terminal to give it more or less room (menu:
   show or hide it).

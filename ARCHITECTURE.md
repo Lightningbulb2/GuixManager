@@ -97,6 +97,18 @@ resolved through symlinks first (its directory is where git runs).
   profile.
 - **Install / remove**: edit the package list, `guix home reconfigure`; on
   failure put the file back.
+- **Build before applying**: before each `guix system|home reconfigure`,
+  `%build-script` (a quoted form in `bump.scm`, written to the state
+  directory and run with the pulled `guix repl`, since after a pull the
+  running modules are the old ones) evaluates the config as the reconfigure
+  will, builds the ungrafted system or home (everything that is compiled,
+  known up front; with grafts most of it would be built while the system is
+  computed), then the grafted one under a build handler that adds what it
+  asks for. It reports through `with-status-report` with one line for every
+  build, weighted by earlier build times. Exit 0 built, 1 failed (the apply
+  stops as a failed reconfigure would), 3 the script itself failed (the
+  reconfigure then builds as usual). The window reads the `[ NN%]` at the
+  start of that line for its bar; that line is for people, not porcelain.
 - **After applying**: compare the profile manifests from before and after
   to list version changes; look through `/proc` for programs still running
   from a replaced store item; compare `/run/booted-system/kernel` with
@@ -112,6 +124,7 @@ resolved through symlinks first (its directory is where git runs).
 | `~/.config/guix-manager/settings` | the settings (config, packages, channels, git); the git remote and identity live in the config's repository |
 | `~/.local/state/guix-bump/previous-pins.scm` | pins before the last change, for `--undo` |
 | `~/.local/state/guix-bump/*.log` | logs written with `--log` |
+| `~/.local/state/guix-bump/build-times.scm` | seconds each build (by package name) took last time, for the progress line; `build.scm` beside it while building |
 | `~/.local/state/guix-bump/check-*` | temporary files of `--check`, deleted afterwards |
 
 ## What is deliberately not here

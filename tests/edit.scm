@@ -173,4 +173,28 @@
 ((f 'write-setting!) "git" "")
 (check "git setting default" ((f 'git-mode)) 'push)
 
+;; The build script run before a reconfigure: it is written out with
+;; `write', so it must read back as the same form; its helpers are checked
+;; by evaluating its definitions (all but the last form, which runs it).
+(define script (f '%build-script))
+(check "build script reads back"
+       (call-with-input-string
+           (call-with-output-string (lambda (port) (write script port)))
+         read)
+       script)
+(define script-module (make-fresh-user-module))
+(for-each (lambda (form) (eval form script-module))
+          (drop-right (cdr script) 1))
+(define (in-script name) (module-ref script-module name))
+(check "build names: store file, log file, script, checkout"
+       (map (in-script 'base-name)
+            '("/gnu/store/53yh05lvf8l0w71vpbz0fh6950bghyab-craft-suite-0.drv"
+              "53yh05lvf8l0w71vpbz0fh6950bghy-ladybird-0.0.0-0.7942cec.drv.gz"
+              "/gnu/store/53yh05lvf8l0w71vpbz0fh6950bghyab-shepherd-timer.scm.drv"
+              "/gnu/store/53yh05lvf8l0w71vpbz0fh6950bghyab-cosmic-term-92b3fb5-checkout.drv"))
+       '("craft-suite" "ladybird" "shepherd-timer.scm" "cosmic-term"))
+(check "build times as a clock"
+       (map (in-script 'clock) '(0 59.6 754 6078))
+       '("0:00" "1:00" "12:34" "1:41:18"))
+
 (exit (if (zero? failures) 0 1))
